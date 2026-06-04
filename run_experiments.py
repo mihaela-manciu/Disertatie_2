@@ -462,7 +462,16 @@ def main():
     manifest_path = os.path.join(root, "results", "experiment_manifest.json")
 
     _banner(f"DISERTATIE_2 EXPERIMENTS | {len(model_keys)} models | 14ch | MARIDA={marida}")
+    print(f"Project root: {root}")
     print(f"Recipe: {args.recipe} | Input channels: {NUM_CHANNELS}")
+    preset = RECIPE_PRESETS[args.recipe]
+    print(
+        f"[config] pretrained_strong expects: two_head={preset.get('two_head_default')} "
+        f"lr={preset.get('lr')} freeze={preset.get('freeze_encoder_epochs')} "
+        f"plastic_boost={preset.get('plastic_boost')} ema={preset.get('ema_decay')}"
+    )
+    if preset.get("two_head_default") and not args.no_two_head:
+        print("[config] Two-head + EMA checkpointing ENABLED (verify log shows two_head=True)")
 
     do_resume = not args.no_resume
     train_results = {"no_aug": {}, "aug": {}}

@@ -211,15 +211,26 @@ def calculate_metrics(conf_matrix, num_classes=4):
 def calculate_debris_metrics(conf_matrix):
     fg_metrics = calculate_metrics(conf_matrix)
     miou_fg = np.mean([fg_metrics[c]["IoU"] for c in (1, 2, 3)])
+
     debris_tp = conf_matrix[1, 1] + conf_matrix[1, 2] + conf_matrix[2, 1] + conf_matrix[2, 2]
     debris_actual = conf_matrix[1, :].sum() + conf_matrix[2, :].sum()
     debris_pred = conf_matrix[:, 1].sum() + conf_matrix[:, 2].sum()
     debris_fp = debris_pred - debris_tp
     debris_fn = debris_actual - debris_tp
     binary_debris_iou = debris_tp / (debris_tp + debris_fp + debris_fn + 1e-8)
+
+    fg_tp = conf_matrix[1:4, 1:4].sum()
+    fg_actual = conf_matrix[1:4, :].sum()
+    fg_pred = conf_matrix[:, 1:4].sum()
+    fg_fp = fg_pred - fg_tp
+    fg_fn = fg_actual - fg_tp
+    binary_foreground_iou = fg_tp / (fg_tp + fg_fp + fg_fn + 1e-8)
+
     return {
         "mIoU_foreground": float(miou_fg),
         "binary_debris_IoU": float(binary_debris_iou),
+        "binary_foreground_IoU": float(binary_foreground_iou),
+        "per_class": fg_metrics,
     }
 
 
@@ -237,9 +248,8 @@ def _decode_batch(model, images, device, two_head=False, debris_threshold=0.5):
     return pred
 
 
-def compute_val_miou_foreground(model, dataloader, device, two_head=False,
-                                 debris_threshold=0.5, use_tta=False,
-                                 postprocess=False, verbose=True):
+def compute_val_metrics(model, dataloader, device, two_head=False,
+                        debris_threshold=0.5, use_tta=False, postprocess=False, verbose=True):
     model.eval()
     conf_matrix = np.zeros((4, 4), dtype=np.int64)
     with torch.no_grad():
@@ -266,13 +276,22 @@ def compute_val_miou_foreground(model, dataloader, device, two_head=False,
                 update_confusion_matrix(conf_matrix, mask_np[sample_idx], p)
     per_class = calculate_metrics(conf_matrix)
     debris_metrics = calculate_debris_metrics(conf_matrix)
-    miou_fg = debris_metrics["mIoU_foreground"]
     if verbose:
         for c in range(1, 4):
             m = per_class[c]
             print(f"  {CLASE_NUME[c]}: IoU={m['IoU']:.4f}  P={m['Precision']:.3f}  R={m['Recall']:.3f}  F1={m['F1-Score']:.3f}")
-        print(f"  Binary fg IoU: {debris_metrics['binary_debris_IoU']:.4f}")
-    return miou_fg
+        print(f"  Binary debris IoU (1+2): {debris_metrics['binary_debris_IoU']:.4f}")
+        print(f"  Binary foreground IoU (1+2+3): {debris_metrics['binary_foreground_IoU']:.4f}")
+    return debris_metrics
+
+
+def compute_val_miou_foreground(model, dataloader, device, two_head=False,
+                                 debris_threshold=0.5, use_tta=False,
+                                 postprocess=False, verbose=True):
+    return compute_val_metrics(
+        model, dataloader, device, two_head=two_head, debris_threshold=debris_threshold,
+        use_tta=use_tta, postprocess=postprocess, verbose=verbose,
+    )["mIoU_foreground"]
 
 
 def _eval_batch(model, images, mask_np, device, cfg, use_two_head):

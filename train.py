@@ -82,7 +82,8 @@ from dataset import (
 from losses import BoundaryLoss, DeepSupervisionHybridLoss, OhemTwoHeadHybridLoss, TwoHeadHybridLoss
 from models import UNetResNet50, TAUNetResNet50, build_model
 from experiment_timing import fmt_duration, print_timing_block, sec_since
-from segmentation_utils import compute_val_miou_foreground
+from segmentation_utils import compute_val_metrics
+from training_stability import MetricEMA, ModelEMA, checkpoint_score, set_training_seed
 
 
 class LinearWarmupCosineScheduler(optim.lr_scheduler._LRScheduler):
@@ -232,7 +233,8 @@ def validate(model, dataloader, criterion, device):
 
 def build_criterion(class_weights, two_head, use_ohem, deep_sup_weights, device,
                     *, use_focal=True, lovasz_weight=0.3, label_smoothing=0.0,
-                    debris_weight=2.0, type_weight=1.5, seg_weight=0.5):
+                    debris_weight=2.0, type_weight=1.5, seg_weight=0.5,
+                    binary_pos_weight=20.0, focal_gamma=1.5):
     if two_head:
         if use_ohem:
             return OhemTwoHeadHybridLoss(
@@ -253,6 +255,8 @@ def build_criterion(class_weights, two_head, use_ohem, deep_sup_weights, device,
             deep_sup_weights=deep_sup_weights,
             use_focal=use_focal,
             lovasz_weight=lovasz_weight,
+            binary_pos_weight=binary_pos_weight,
+            focal_gamma=focal_gamma,
         ).to(device)
     return DeepSupervisionHybridLoss(
         deep_sup_weights=deep_sup_weights,
@@ -263,7 +267,7 @@ def build_criterion(class_weights, two_head, use_ohem, deep_sup_weights, device,
     ).to(device)
 
 
-DEEP_SUP_WEIGHTS = [0.15, 0.10, 0.05]
+DEEP_SUP_WEIGHTS = [0.08, 0.05, 0.02]
 
 RECIPE_PRESETS = {
     "balanced": {
@@ -343,10 +347,10 @@ RECIPE_PRESETS = {
         "plastic_boost": 20.0,
         "lr": 5e-5,
         "decoder_lr_mult": 10.0,
-        "warmup_epochs": 5,
+        "warmup_epochs": 8,
         "label_smoothing": 0.05,
         "class_weights_from_data": True,
-        "freeze_encoder_epochs": 5,
+        "freeze_encoder_epochs": 8,
         "default_epochs": 150,
         "default_patience": 35,
         "use_ssag": True,
@@ -355,8 +359,29 @@ RECIPE_PRESETS = {
         "copy_paste_prob": 0.4,
         "tta_scales_eval": [0.75, 1.0, 1.25],
         "backbone": "ssl4eo",
+        "ema_decay": 0.999,
+        "metric_ema_decay": 0.85,
+        "checkpoint_miou_weight": 0.4,
+        "checkpoint_fg_binary_weight": 0.6,
+        "binary_pos_weight": 25.0,
+        "focal_gamma": 1.5,
+        "debris_weight": 2.5,
+        "type_weight": 2.0,
+        "seg_weight": 0.4,
+        "seed": 42,
     },
 }
+
+
+def print_recipe_config(recipe: str, preset: dict, *, two_head: bool, model_key: str) -> None:
+    print(
+        f"[config] build={os.path.basename(os.path.dirname(os.path.abspath(__file__)))} "
+        f"recipe={recipe} model={model_key} two_head={two_head} "
+        f"lr={preset.get('lr')} freeze={preset.get('freeze_encoder_epochs')} "
+        f"debris_boost={preset.get('debris_boost')} plastic_boost={preset.get('plastic_boost')} "
+        f"copy_paste={preset.get('copy_paste_prob')} ema={preset.get('ema_decay', 0)} "
+        f"lovasz={preset.get('lovasz_weight')}"
+    )
 
 
 def resolve_two_head(model_key, recipe, two_head=None):
@@ -431,7 +456,12 @@ def run_training(
         else f"istoric_antrenare_{model_key}.csv"
     )
 
+    print_recipe_config(recipe, preset, two_head=two_head, model_key=model_key)
     print(f"\n{'=' * 60}\nAntrenare: {model_key} | device={device} | two_head={two_head}\n{'=' * 60}")
+
+    seed = int(preset.get("seed", 42))
+    set_training_seed(seed)
+    print(f"[config] random seed={seed}")
 
     t_run = time.perf_counter()
     timing = {}
@@ -504,6 +534,11 @@ def run_training(
         use_focal=preset["use_focal"],
         lovasz_weight=preset["lovasz_weight"],
         label_smoothing=label_smoothing,
+        debris_weight=preset.get("debris_weight", 2.0),
+        type_weight=preset.get("type_weight", 1.5),
+        seg_weight=preset.get("seg_weight", 0.5),
+        binary_pos_weight=preset.get("binary_pos_weight", 20.0),
+        focal_gamma=preset.get("focal_gamma", 1.5),
     )
 
     boundary_weight = preset.get("boundary_weight", 0.0)
@@ -556,12 +591,21 @@ def run_training(
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     timing["setup_optimizer_sec"] = sec_since(t_step)
 
+    ema_decay = float(preset.get("ema_decay", 0.999))
+    metric_ema_decay = float(preset.get("metric_ema_decay", 0.85))
+    ckpt_miou_w = float(preset.get("checkpoint_miou_weight", 0.4))
+    ckpt_fg_w = float(preset.get("checkpoint_fg_binary_weight", 0.6))
+    score_ema = MetricEMA(decay=metric_ema_decay)
+
     best_val_miou = -1.0
+    best_checkpoint_score = -1.0
+    best_checkpoint_score_ema = -1.0
     epochs_no_improve = 0
     epochs_ran = 0
     start_epoch = 0
     istoric = {
-        "train_loss": [], "val_loss": [], "val_miou_fg": [], "lr": [],
+        "train_loss": [], "val_loss": [], "val_miou_fg": [], "val_fg_binary_iou": [],
+        "val_checkpoint_score": [], "val_checkpoint_score_ema": [], "lr": [],
         "epoch_sec": [], "train_sec": [], "val_sec": [], "val_miou_sec": [],
     }
     paste_stats_all = {"pasted_pixels": 0, "total_pixels": 0}
@@ -577,13 +621,21 @@ def run_training(
             best_val_miou = float(ckpt.get("best_val_miou", -1.0))
             epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
             istoric = ckpt.get("istoric", istoric)
-            for key in ("epoch_sec", "train_sec", "val_sec", "val_miou_sec"):
+            for key in (
+                "epoch_sec", "train_sec", "val_sec", "val_miou_sec",
+                "val_fg_binary_iou", "val_checkpoint_score", "val_checkpoint_score_ema",
+            ):
                 istoric.setdefault(key, [])
+            best_checkpoint_score = float(ckpt.get("best_checkpoint_score", best_checkpoint_score))
+            best_checkpoint_score_ema = float(
+                ckpt.get("best_checkpoint_score_ema", best_checkpoint_score_ema)
+            )
             paste_stats_all = ckpt.get("paste_stats_all", paste_stats_all)
             print(f"Resumed from {state_path} at epoch {start_epoch + 1}")
         except Exception as exc:
             print(f"Resume failed ({exc}); starting from scratch.")
     timing["resume_sec"] = sec_since(t_step)
+    model_ema = ModelEMA(model, decay=ema_decay) if ema_decay > 0 else None
 
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     stop_file = os.path.join(_script_dir, "STOP")
@@ -597,6 +649,8 @@ def run_training(
                     "scheduler": scheduler.state_dict(),
                     "epoch": epoch_done,
                     "best_val_miou": best_val_miou,
+                    "best_checkpoint_score": best_checkpoint_score,
+                    "best_checkpoint_score_ema": best_checkpoint_score_ema,
                     "epochs_no_improve": epochs_no_improve,
                     "istoric": istoric,
                     "paste_stats_all": paste_stats_all,
@@ -631,15 +685,32 @@ def run_training(
                 grad_accum_steps=grad_accum_steps,
             )
             train_sec = sec_since(t_train)
+            if model_ema is not None:
+                model_ema.update(model)
 
             t_val = time.perf_counter()
             val_loss = validate(model, val_loader, criterion, device)
             val_part_sec = sec_since(t_val)
 
             t_miou = time.perf_counter()
-            val_miou_fg = compute_val_miou_foreground(
-                model, val_loader, device, two_head=two_head, verbose=True,
+            if model_ema is not None:
+                backup = model_ema.apply(model)
+                try:
+                    val_metrics = compute_val_metrics(
+                        model, val_loader, device, two_head=two_head, verbose=True,
+                    )
+                finally:
+                    ModelEMA.restore(model, backup)
+            else:
+                val_metrics = compute_val_metrics(
+                    model, val_loader, device, two_head=two_head, verbose=True,
+                )
+            val_miou_fg = val_metrics["mIoU_foreground"]
+            val_fg_binary = val_metrics["binary_foreground_IoU"]
+            val_ckpt_score = checkpoint_score(
+                val_metrics, miou_weight=ckpt_miou_w, fg_binary_weight=ckpt_fg_w,
             )
+            val_ckpt_score_ema = score_ema.update(val_ckpt_score)
             val_miou_sec = sec_since(t_miou)
             val_sec = round(val_part_sec + val_miou_sec, 2)
             epoch_sec = sec_since(t_epoch)
@@ -654,16 +725,25 @@ def run_training(
 
         print(
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Val mIoU (fg): {val_miou_fg:.4f} | LR: {lr_curent:.6f} | "
+            f"Val mIoU (fg): {val_miou_fg:.4f} | Fg-bin IoU: {val_fg_binary:.4f} | "
+            f"Score: {val_ckpt_score:.4f} (EMA {val_ckpt_score_ema:.4f}) | LR: {lr_curent:.6f} | "
             f"Time: train {fmt_duration(train_sec)} val {fmt_duration(val_sec)} "
             f"(ep {fmt_duration(epoch_sec)})"
         )
 
         if val_miou_fg > best_val_miou:
             best_val_miou = val_miou_fg
+
+        if val_ckpt_score_ema > best_checkpoint_score_ema:
+            best_checkpoint_score_ema = val_ckpt_score_ema
+            best_checkpoint_score = val_ckpt_score
             epochs_no_improve = 0
-            torch.save(model.state_dict(), checkpoint_path)
-            print(f"*** Salvat (mIoU fg={best_val_miou:.4f}) -> {checkpoint_path} ***")
+            save_state = model_ema.shadow if model_ema is not None else model.state_dict()
+            torch.save(save_state, checkpoint_path)
+            print(
+                f"*** Salvat (score EMA={best_checkpoint_score_ema:.4f}, "
+                f"mIoU={val_miou_fg:.4f}, fg-bin={val_fg_binary:.4f}) -> {checkpoint_path} ***"
+            )
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -673,6 +753,9 @@ def run_training(
         istoric["train_loss"].append(train_loss)
         istoric["val_loss"].append(val_loss)
         istoric["val_miou_fg"].append(val_miou_fg)
+        istoric["val_fg_binary_iou"].append(val_fg_binary)
+        istoric["val_checkpoint_score"].append(val_ckpt_score)
+        istoric["val_checkpoint_score_ema"].append(val_ckpt_score_ema)
         istoric["lr"].append(lr_curent)
         istoric["epoch_sec"].append(epoch_sec)
         istoric["train_sec"].append(train_sec)
@@ -717,6 +800,8 @@ def run_training(
         "checkpoint_path": checkpoint_path,
         "history_path": history_path,
         "best_val_miou_fg": best_val_miou,
+        "best_checkpoint_score": best_checkpoint_score,
+        "best_checkpoint_score_ema": best_checkpoint_score_ema,
         "epochs_ran": epochs_ran,
         "interrupted": interrupted,
         "two_head": two_head,

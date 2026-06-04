@@ -142,23 +142,29 @@ class TwoHeadHybridLoss(nn.Module):
         deep_sup_weights=None,
         use_focal=True,
         lovasz_weight=0.3,
+        binary_pos_weight=20.0,
+        focal_gamma=1.5,
     ):
         super().__init__()
         self.seg_loss = HybridLoss(
             weight=class_weight,
             use_focal=use_focal,
             lovasz_weight=lovasz_weight,
+            focal_gamma=focal_gamma,
         )
         self.seg_weight = seg_weight
         self.debris_weight = debris_weight
         self.type_weight = type_weight
-        self.debris_bce = nn.BCEWithLogitsLoss()
+        pos_w = torch.tensor([binary_pos_weight], dtype=torch.float32)
+        self.register_buffer("_pos_weight", pos_w)
         self.deep_sup_weights = deep_sup_weights or []
 
     def forward(self, outputs, target):
         loss = self.seg_weight * self.seg_loss(outputs, target)
         fg_target = (target > 0).float().unsqueeze(1)
-        loss = loss + self.debris_weight * self.debris_bce(outputs["debris"], fg_target)
+        loss = loss + self.debris_weight * F.binary_cross_entropy_with_logits(
+            outputs["debris"], fg_target, pos_weight=self._pos_weight,
+        )
         type_labels = torch.full_like(target, 255)
         fg = target > 0
         type_labels[fg] = target[fg] - 1
@@ -268,7 +274,9 @@ class OhemTwoHeadHybridLoss(TwoHeadHybridLoss):
                 F.softmax(seg_logits, dim=1), target, classes="present"
             )
         fg_target = (target > 0).float().unsqueeze(1)
-        loss = loss + self.debris_weight * self.debris_bce(outputs["debris"], fg_target)
+        loss = loss + self.debris_weight * F.binary_cross_entropy_with_logits(
+            outputs["debris"], fg_target, pos_weight=self._pos_weight,
+        )
         type_labels = torch.full_like(target, 255)
         fg = target > 0
         type_labels[fg] = target[fg] - 1
