@@ -136,8 +136,9 @@ class TwoHeadHybridLoss(nn.Module):
     def __init__(
         self,
         class_weight=None,
-        debris_weight=1.0,
-        type_weight=0.5,
+        debris_weight=2.0,
+        type_weight=1.5,
+        seg_weight=0.5,
         deep_sup_weights=None,
         use_focal=True,
         lovasz_weight=0.3,
@@ -148,15 +149,16 @@ class TwoHeadHybridLoss(nn.Module):
             use_focal=use_focal,
             lovasz_weight=lovasz_weight,
         )
+        self.seg_weight = seg_weight
         self.debris_weight = debris_weight
         self.type_weight = type_weight
         self.debris_bce = nn.BCEWithLogitsLoss()
         self.deep_sup_weights = deep_sup_weights or []
 
     def forward(self, outputs, target):
-        loss = self.seg_loss(outputs, target)
-        debris_target = ((target == 1) | (target == 2)).float().unsqueeze(1)
-        loss = loss + self.debris_weight * self.debris_bce(outputs["debris"], debris_target)
+        loss = self.seg_weight * self.seg_loss(outputs, target)
+        fg_target = (target > 0).float().unsqueeze(1)
+        loss = loss + self.debris_weight * self.debris_bce(outputs["debris"], fg_target)
         type_labels = torch.full_like(target, 255)
         fg = target > 0
         type_labels[fg] = target[fg] - 1
@@ -165,7 +167,7 @@ class TwoHeadHybridLoss(nn.Module):
                 outputs["type"], type_labels, ignore_index=255
             )
         for w, aux_logits in zip(self.deep_sup_weights, outputs.get("aux", [])):
-            loss = loss + w * self.seg_loss(aux_logits, target)
+            loss = loss + w * self.seg_weight * self.seg_loss(aux_logits, target)
         return loss
 
 
@@ -265,8 +267,8 @@ class OhemTwoHeadHybridLoss(TwoHeadHybridLoss):
             loss = loss + self.seg_loss.lovasz_weight * lovasz_softmax(
                 F.softmax(seg_logits, dim=1), target, classes="present"
             )
-        debris_target = ((target == 1) | (target == 2)).float().unsqueeze(1)
-        loss = loss + self.debris_weight * self.debris_bce(outputs["debris"], debris_target)
+        fg_target = (target > 0).float().unsqueeze(1)
+        loss = loss + self.debris_weight * self.debris_bce(outputs["debris"], fg_target)
         type_labels = torch.full_like(target, 255)
         fg = target > 0
         type_labels[fg] = target[fg] - 1
@@ -275,5 +277,5 @@ class OhemTwoHeadHybridLoss(TwoHeadHybridLoss):
                 outputs["type"], type_labels, ignore_index=255
             )
         for w, aux_logits in zip(self.deep_sup_weights, outputs.get("aux", [])):
-            loss = loss + w * self.seg_loss(aux_logits, target)
+            loss = loss + w * self.seg_weight * self.seg_loss(aux_logits, target)
         return loss

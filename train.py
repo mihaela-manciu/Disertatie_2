@@ -230,13 +230,15 @@ def validate(model, dataloader, criterion, device):
 
 
 def build_criterion(class_weights, two_head, use_ohem, deep_sup_weights, device,
-                    *, use_focal=True, lovasz_weight=0.3, label_smoothing=0.0):
+                    *, use_focal=True, lovasz_weight=0.3, label_smoothing=0.0,
+                    debris_weight=2.0, type_weight=1.5, seg_weight=0.5):
     if two_head:
         if use_ohem:
             return OhemTwoHeadHybridLoss(
                 class_weight=class_weights,
-                debris_weight=1.0,
-                type_weight=0.5,
+                debris_weight=debris_weight,
+                type_weight=type_weight,
+                seg_weight=seg_weight,
                 deep_sup_weights=deep_sup_weights,
                 use_focal=use_focal,
                 lovasz_weight=lovasz_weight,
@@ -244,8 +246,9 @@ def build_criterion(class_weights, two_head, use_ohem, deep_sup_weights, device,
             ).to(device)
         return TwoHeadHybridLoss(
             class_weight=class_weights,
-            debris_weight=1.0,
-            type_weight=0.5,
+            debris_weight=debris_weight,
+            type_weight=type_weight,
+            seg_weight=seg_weight,
             deep_sup_weights=deep_sup_weights,
             use_focal=use_focal,
             lovasz_weight=lovasz_weight,
@@ -334,10 +337,10 @@ RECIPE_PRESETS = {
         "lovasz_weight": 0.10,
         "use_ohem": False,
         "use_deep_sup": True,
-        "two_head_default": False,
-        "debris_boost": 5.0,
-        "plastic_boost": 12.0,
-        "lr": 1e-4,
+        "two_head_default": True,
+        "debris_boost": 8.0,
+        "plastic_boost": 20.0,
+        "lr": 5e-5,
         "decoder_lr_mult": 10.0,
         "warmup_epochs": 5,
         "label_smoothing": 0.05,
@@ -348,7 +351,7 @@ RECIPE_PRESETS = {
         "use_ssag": True,
         "boundary_weight": 0.0,
         "grad_accum_steps": 4,
-        "copy_paste_prob": 0.7,
+        "copy_paste_prob": 0.4,
         "tta_scales_eval": [0.75, 1.0, 1.25],
         "backbone": "ssl4eo",
     },
