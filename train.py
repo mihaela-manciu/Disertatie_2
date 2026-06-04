@@ -259,7 +259,7 @@ def build_criterion(class_weights, two_head, use_ohem, deep_sup_weights, device,
     ).to(device)
 
 
-DEEP_SUP_WEIGHTS = [0.4, 0.3, 0.2]
+DEEP_SUP_WEIGHTS = [0.15, 0.10, 0.05]
 
 RECIPE_PRESETS = {
     "balanced": {
@@ -331,7 +331,7 @@ RECIPE_PRESETS = {
     "pretrained_strong": {
         "class_weights": "auto",
         "use_focal": True,
-        "lovasz_weight": 0.20,
+        "lovasz_weight": 0.10,
         "use_ohem": False,
         "use_deep_sup": True,
         "two_head_default": False,
@@ -346,7 +346,7 @@ RECIPE_PRESETS = {
         "default_epochs": 150,
         "default_patience": 35,
         "use_ssag": True,
-        "boundary_weight": 0.1,
+        "boundary_weight": 0.0,
         "grad_accum_steps": 4,
         "copy_paste_prob": 0.7,
         "tta_scales_eval": [0.75, 1.0, 1.25],

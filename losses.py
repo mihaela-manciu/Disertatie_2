@@ -96,7 +96,12 @@ class HybridLoss(nn.Module):
         union = pred_probs.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))
         dice_score = (2.0 * intersection + smooth) / (union + smooth)
         dice_score = torch.clamp(dice_score, 0.0, 1.0)
-        return 1.0 - dice_score[:, 1:].mean()
+
+        fg_scores = dice_score[:, 1:]
+        fg_present = target_one_hot[:, 1:].sum(dim=(2, 3)) > 0
+        if fg_present.any():
+            return 1.0 - fg_scores[fg_present].mean()
+        return pred.sum() * 0.0
 
     def forward(self, pred, target):
         if isinstance(pred, dict):

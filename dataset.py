@@ -233,7 +233,7 @@ def load_channel_stats(root_dir):
     return compute_channel_stats(root_dir)
 
 
-def get_inverse_freq_weights(stats, smoothing=0.1, max_weight=50.0):
+def get_inverse_freq_weights(stats, smoothing=0.05, max_weight=50.0):
     freqs = np.array(stats["class_frequencies"], dtype=np.float64)
     freqs = np.maximum(freqs, 1e-6)
     inv = 1.0 / freqs
@@ -273,6 +273,8 @@ class MARIDADataset(Dataset):
             self.image_names = [line.strip() for line in f.readlines()]
 
         self.class_mapping = {1: 1, 2: 2, 3: 2, 4: 2, 5: 3}
+
+        self._data_scale = _detect_data_scale(root_dir)
 
         self._channel_mean = None
         self._channel_std = None
@@ -340,9 +342,8 @@ class MARIDADataset(Dataset):
             img = src.read().astype(np.float32)
 
         img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
-        scale = _detect_data_scale(self.root_dir)
-        if scale != 1.0:
-            img = img / scale
+        if self._data_scale != 1.0:
+            img = img / self._data_scale
         img = np.clip(img, 0.0, 1.0)
 
         ndvi, fdi, pi = _compute_spectral_indices(img)
