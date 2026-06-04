@@ -5,6 +5,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _as_long_target(target, num_classes=4):
+    """Cross-entropy, one_hot, and type labels require integer class indices."""
+    if not torch.is_tensor(target):
+        target = torch.as_tensor(target)
+    if target.dtype != torch.long:
+        target = target.long()
+    return target.clamp(0, num_classes - 1)
+
+
+def _type_labels_from_target(target, num_classes=4):
+    target = _as_long_target(target, num_classes)
+    type_labels = torch.full(
+        target.shape, 255, dtype=torch.long, device=target.device,
+    )
+    fg = target > 0
+    if fg.any():
+        type_labels = type_labels.clone()
+        type_labels[fg] = target[fg] - 1
+    return type_labels
+
+
 def _lovasz_grad(gt_sorted):
     p = len(gt_sorted)
     gts = gt_sorted.sum()
@@ -54,6 +75,7 @@ class FocalLoss(nn.Module):
         self.ignore_index = ignore_index
 
     def forward(self, logits, target):
+        target = _as_long_target(target, logits.shape[1])
         ce = F.cross_entropy(
             logits, target, weight=self.weight, reduction="none", ignore_index=self.ignore_index
         )
@@ -90,7 +112,7 @@ class HybridLoss(nn.Module):
     def dice_loss(self, pred, target, smooth=1e-5):
         pred = pred.float()
         pred_probs = F.softmax(pred, dim=1)
-        target = target.clamp(0, pred.shape[1] - 1)
+        target = _as_long_target(target, pred.shape[1])
         target_one_hot = F.one_hot(target, num_classes=pred.shape[1]).permute(0, 3, 1, 2).float()
         intersection = (pred_probs * target_one_hot).sum(dim=(2, 3))
         union = pred_probs.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))
@@ -107,7 +129,7 @@ class HybridLoss(nn.Module):
         if isinstance(pred, dict):
             pred = pred["seg"]
         pred = pred.float()
-        target = target.clamp(0, pred.shape[1] - 1)
+        target = _as_long_target(target, pred.shape[1])
         ce = self.cls_loss(pred, target)
         dice = self.dice_loss(pred, target)
         loss = self.ce_weight * ce + self.dice_weight * dice
@@ -160,17 +182,16 @@ class TwoHeadHybridLoss(nn.Module):
         self.deep_sup_weights = deep_sup_weights or []
 
     def forward(self, outputs, target):
+        target = _as_long_target(target, outputs["seg"].shape[1])
         loss = self.seg_weight * self.seg_loss(outputs, target)
         fg_target = (target > 0).float().unsqueeze(1)
         loss = loss + self.debris_weight * F.binary_cross_entropy_with_logits(
             outputs["debris"], fg_target, pos_weight=self._pos_weight,
         )
-        type_labels = torch.full_like(target, 255)
-        fg = target > 0
-        type_labels[fg] = target[fg] - 1
-        if fg.any():
+        type_labels = _type_labels_from_target(target, outputs["seg"].shape[1])
+        if (type_labels != 255).any():
             loss = loss + self.type_weight * F.cross_entropy(
-                outputs["type"], type_labels, ignore_index=255
+                outputs["type"], type_labels, ignore_index=255,
             )
         for w, aux_logits in zip(self.deep_sup_weights, outputs.get("aux", [])):
             loss = loss + w * self.seg_weight * self.seg_loss(aux_logits, target)
@@ -178,6 +199,7 @@ class TwoHeadHybridLoss(nn.Module):
 
 
 def ohem_cross_entropy(logits, target, weight=None, keep_ratio=0.25, min_kept=4096):
+    target = _as_long_target(target, logits.shape[1])
     per_pixel = F.cross_entropy(logits, target, weight=weight, reduction="none")
     flat = per_pixel.view(-1)
     n = flat.numel()
@@ -264,6 +286,7 @@ class OhemTwoHeadHybridLoss(TwoHeadHybridLoss):
         self.class_weight = class_weight
 
     def forward(self, outputs, target):
+        target = _as_long_target(target, outputs["seg"].shape[1])
         seg_logits = outputs["seg"]
         ce = ohem_cross_entropy(seg_logits, target, weight=self.class_weight,
                                 keep_ratio=self.keep_ratio)
@@ -277,12 +300,10 @@ class OhemTwoHeadHybridLoss(TwoHeadHybridLoss):
         loss = loss + self.debris_weight * F.binary_cross_entropy_with_logits(
             outputs["debris"], fg_target, pos_weight=self._pos_weight,
         )
-        type_labels = torch.full_like(target, 255)
-        fg = target > 0
-        type_labels[fg] = target[fg] - 1
-        if fg.any():
+        type_labels = _type_labels_from_target(target, seg_logits.shape[1])
+        if (type_labels != 255).any():
             loss = loss + self.type_weight * F.cross_entropy(
-                outputs["type"], type_labels, ignore_index=255
+                outputs["type"], type_labels, ignore_index=255,
             )
         for w, aux_logits in zip(self.deep_sup_weights, outputs.get("aux", [])):
             loss = loss + w * self.seg_weight * self.seg_loss(aux_logits, target)

@@ -105,7 +105,7 @@ class LinearWarmupCosineScheduler(optim.lr_scheduler._LRScheduler):
 
 def _sanitize_batch(images, masks, num_classes=4):
     images = torch.nan_to_num(images, nan=0.0, posinf=0.0, neginf=0.0)
-    masks = masks.clamp(0, num_classes - 1)
+    masks = masks.long().clamp(0, num_classes - 1)
     return images, masks
 
 
