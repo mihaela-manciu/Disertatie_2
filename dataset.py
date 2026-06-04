@@ -485,6 +485,7 @@ def get_training_augmentation(enable=True):
                 scale=(0.9, 1.1),
                 rotate=(-15, 15),
                 p=0.3,
+                mask_interpolation=0,
             ),
             ToTensorV2(),
         ]

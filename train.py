@@ -150,7 +150,17 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
             outputs = {k: v.float() if torch.is_tensor(v) else v for k, v in outputs.items()}
         elif torch.is_tensor(outputs):
             outputs = outputs.float()
-        loss = criterion(outputs, masks)
+        try:
+            loss = criterion(outputs, masks)
+        except RuntimeError as exc:
+            if steps <= 1:
+                import traceback
+                print(
+                    f"\n[train] batch {steps} failed: masks dtype={masks.dtype} "
+                    f"shape={tuple(masks.shape)} min={int(masks.min())} max={int(masks.max())}"
+                )
+                traceback.print_exc()
+            raise exc
         loss = loss / grad_accum_steps
 
         if not torch.isfinite(loss):
@@ -374,14 +384,19 @@ RECIPE_PRESETS = {
 
 
 def print_recipe_config(recipe: str, preset: dict, *, two_head: bool, model_key: str) -> None:
+    import losses as _losses_mod
+    losses_path = os.path.abspath(_losses_mod.__file__)
+    dtype_guard = hasattr(_losses_mod, "_type_labels_from_target")
     print(
         f"[config] build={os.path.basename(os.path.dirname(os.path.abspath(__file__)))} "
         f"recipe={recipe} model={model_key} two_head={two_head} "
         f"lr={preset.get('lr')} freeze={preset.get('freeze_encoder_epochs')} "
         f"debris_boost={preset.get('debris_boost')} plastic_boost={preset.get('plastic_boost')} "
         f"copy_paste={preset.get('copy_paste_prob')} ema={preset.get('ema_decay', 0)} "
-        f"lovasz={preset.get('lovasz_weight')}"
+        f"lovasz={preset.get('lovasz_weight')} "
+        f"loss_dtype_guard={dtype_guard}"
     )
+    print(f"[config] losses module: {losses_path}")
 
 
 def resolve_two_head(model_key, recipe, two_head=None):

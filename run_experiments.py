@@ -555,7 +555,9 @@ def main():
                         user_stopped = True
                         break
                     except Exception as exc:
+                        import traceback
                         print(f"EROARE antrenare {model_key}/{variant}: {exc}")
+                        traceback.print_exc()
                         train_results[variant][model_key] = {"error": str(exc)}
                 if user_stopped:
                     break

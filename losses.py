@@ -8,22 +8,22 @@ import torch.nn.functional as F
 def _as_long_target(target, num_classes=4):
     """Cross-entropy, one_hot, and type labels require integer class indices."""
     if not torch.is_tensor(target):
-        target = torch.as_tensor(target)
+        target = torch.as_tensor(target, dtype=torch.long)
     if target.dtype != torch.long:
         target = target.long()
+    if target.ndim == 4 and target.shape[1] == 1:
+        target = target.squeeze(1)
+    elif target.ndim > 3:
+        target = target.reshape(target.shape[0], *target.shape[-2:])
     return target.clamp(0, num_classes - 1)
 
 
 def _type_labels_from_target(target, num_classes=4):
+    """Type head labels: 255 = ignore (water), else class_id - 1."""
     target = _as_long_target(target, num_classes)
-    type_labels = torch.full(
-        target.shape, 255, dtype=torch.long, device=target.device,
-    )
     fg = target > 0
-    if fg.any():
-        type_labels = type_labels.clone()
-        type_labels[fg] = target[fg] - 1
-    return type_labels
+    type_vals = torch.where(fg, target - 1, torch.zeros_like(target))
+    return torch.where(fg, type_vals, torch.full_like(target, 255))
 
 
 def _lovasz_grad(gt_sorted):
@@ -58,6 +58,7 @@ def lovasz_softmax_flat(probas, labels, classes="present"):
 
 
 def lovasz_softmax(probas, labels, classes="present"):
+    labels = _as_long_target(labels, probas.shape[1])
     losses = []
     for prob, lab in zip(probas, labels):
         c = prob.shape[0]
@@ -226,6 +227,7 @@ class OhemHybridLoss(nn.Module):
     def forward(self, pred, target):
         if isinstance(pred, dict):
             pred = pred["seg"]
+        target = _as_long_target(target, pred.shape[1])
         if self.use_focal:
             ce = FocalLoss(weight=self.weight)(pred, target)
         else:

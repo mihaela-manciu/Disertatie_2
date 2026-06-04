@@ -83,7 +83,7 @@ def _load_ssl4eo_resnet50(in_channels=14):
     stem_conv = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
     stem_conv.weight = nn.Parameter(full_weights)
     print(f"[backbone] Sentinel-2 stem: mapped 11/13 bands + {in_channels - 11} index channels "
-          f"→ conv1 shape {tuple(stem_conv.weight.shape)}")
+          f"-> conv1 shape {tuple(stem_conv.weight.shape)}")
 
     return resnet, stem_conv
 
