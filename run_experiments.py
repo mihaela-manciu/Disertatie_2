@@ -29,6 +29,7 @@ from evaluate import evaluate_pipeline, plot_training_curves, plot_training_curv
 from dataset import MARIDADataset, get_validation_augmentation, load_channel_stats, NUM_CHANNELS
 from models import build_model
 from segmentation_utils import _eval_batch
+from experiment_timing import fmt_duration, print_timing_block, sec_since
 from train import run_training, RECIPE_PRESETS, resolve_two_head
 from visual_reporting import save_zoom_comparison
 
@@ -176,16 +177,22 @@ def train_experiment_variant(
 
     train_result["display_name"] = spec["display_name"]
     train_result["variant"] = variant
-    train_result["duration_sec"] = round(time.time() - t0, 1)
+    train_result["wall_duration_sec"] = round(time.time() - t0, 1)
+    if "duration_sec" not in train_result:
+        train_result["duration_sec"] = train_result["wall_duration_sec"]
 
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "train_summary.json"), "w", encoding="utf-8") as f:
         json.dump(train_result, f, indent=2)
+    if train_result.get("timing"):
+        with open(os.path.join(run_dir, "train_timing.json"), "w", encoding="utf-8") as f:
+            json.dump(train_result["timing"], f, indent=2)
     return train_result
 
 
 def evaluate_variant(marida_path, model_key, root, *, variant, tune_on_val,
                      force_retune, eval_workers, fast_tune=True):
+    t0 = time.time()
     spec = EXPERIMENT_SPECS[model_key]
     ckpt = os.path.join(root, "saved_models", variant, f"{model_key}_best.pth")
     results_dir = os.path.join(root, "results", model_key, variant)
@@ -205,16 +212,21 @@ def evaluate_variant(marida_path, model_key, root, *, variant, tune_on_val,
     print(f"[{model_key}/{variant}] eval two_head="
           f"{two_head_hint if two_head_hint is not None else 'auto-detect from checkpoint'}")
 
-    return evaluate_pipeline(
+    result = evaluate_pipeline(
         marida_path, ckpt, model_key=model_key,
         model_name=f"{spec['display_name']} ({variant})",
         results_dir=results_dir, eval_config_path=eval_cfg,
         tune_on_val=tune_on_val, two_head=two_head_hint,
         num_workers=eval_workers, fast_tune=fast_tune,
     )
+    result["wall_duration_sec"] = round(time.time() - t0, 1)
+    if "duration_sec" not in result:
+        result["duration_sec"] = result["wall_duration_sec"]
+    return result
 
 
 def build_visual_comparisons(marida_path, model_key, root, *, max_samples=8):
+    t0 = time.perf_counter()
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     no_path = os.path.join(root, "saved_models", "no_aug", f"{model_key}_best.pth")
@@ -266,6 +278,10 @@ def build_visual_comparisons(marida_path, model_key, root, *, max_samples=8):
             channel_mean=ch_mean, channel_std=ch_std,
         )
 
+    duration = sec_since(t0)
+    print(f"[timing] visual comparisons {model_key}: {fmt_duration(duration)}")
+    return {"duration_sec": duration, "samples": min(max_samples, len(ds))}
+
 
 def build_comparison_row(model_key, root, train_info, eval_info):
     spec = EXPERIMENT_SPECS[model_key]
@@ -304,7 +320,12 @@ def build_comparison_row(model_key, root, train_info, eval_info):
         row["best_val_miou_fg"] = train_info.get("best_val_miou_fg")
         row["train_epochs_ran"] = train_info.get("epochs_ran")
         row["train_duration_sec"] = train_info.get("duration_sec")
+        if train_info.get("timing"):
+            row["train_avg_epoch_sec"] = train_info["timing"].get("avg_epoch_sec")
     row["eval_duration_sec"] = eval_info.get("duration_sec")
+    if eval_info.get("timing"):
+        row["eval_tune_sec"] = eval_info["timing"].get("tune_on_val_sec")
+        row["eval_test_sec"] = eval_info["timing"].get("test_inference_sec")
     return row
 
 
@@ -446,10 +467,19 @@ def main():
     do_resume = not args.no_resume
     train_results = {"no_aug": {}, "aug": {}}
     eval_results = {"no_aug": {}, "aug": {}}
+    pipeline_timing = {"steps": [], "by_model": {}}
+    t_pipeline = time.perf_counter()
+
+    def _record_step(step_name, duration_sec, **extra):
+        entry = {"step": step_name, "duration_sec": round(float(duration_sec), 2), **extra}
+        pipeline_timing["steps"].append(entry)
+        print(f"[timing] {step_name}: {fmt_duration(duration_sec)}")
 
     def _save_manifest(status="in_progress"):
         manifest["status"] = status
         manifest["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        manifest["pipeline_timing"] = pipeline_timing
+        manifest["pipeline_elapsed_sec"] = sec_since(t_pipeline)
         try:
             with open(manifest_path, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, indent=2)
@@ -476,16 +506,35 @@ def main():
             if not args.skip_train:
                 for variant in ("no_aug", "aug"):
                     try:
+                        t_step = time.perf_counter()
                         result = train_experiment_variant(
                             marida, model_key, root, variant=variant, **_train_kwargs)
                         train_results[variant][model_key] = result
+                        _record_step(
+                            f"train/{model_key}/{variant}",
+                            sec_since(t_step),
+                            model=model_key,
+                            variant=variant,
+                            duration_sec=result.get("duration_sec"),
+                        )
+                        pipeline_timing.setdefault("by_model", {}).setdefault(model_key, {})[variant] = {
+                            "train_sec": result.get("duration_sec"),
+                            "train_timing": result.get("timing"),
+                        }
                         _save_manifest()
                         hist_csv = result.get("history_path")
                         if hist_csv and os.path.isfile(hist_csv):
                             curve_dir = os.path.join(root, "results", model_key, variant)
                             try:
+                                t_plot = time.perf_counter()
                                 plot_training_curves(hist_csv, curve_dir,
                                                     f"{spec['display_name']} ({variant})")
+                                _record_step(
+                                    f"plot_curves/{model_key}/{variant}",
+                                    sec_since(t_plot),
+                                    model=model_key,
+                                    variant=variant,
+                                )
                             except Exception as exc:
                                 print(f"[warning] training curves plot failed: {exc}")
                         if result.get("interrupted"):
@@ -509,6 +558,7 @@ def main():
                         print(f"[{model_key}/{variant}] checkpoint lipsă. Evaluare omisă.")
                         continue
                     try:
+                        t_step = time.perf_counter()
                         fast_tune = not args.full_tune
                         if args.recipe in ("strong", "strong_two_head", "pretrained_strong"):
                             fast_tune = False
@@ -517,6 +567,17 @@ def main():
                             tune_on_val=tune_on_val, force_retune=args.retune,
                             eval_workers=args.eval_workers, fast_tune=fast_tune,
                         )
+                        ev = eval_results[variant][model_key]
+                        _record_step(
+                            f"eval/{model_key}/{variant}",
+                            sec_since(t_step),
+                            model=model_key,
+                            variant=variant,
+                            duration_sec=ev.get("duration_sec"),
+                        )
+                        pipeline_timing.setdefault("by_model", {}).setdefault(model_key, {}).setdefault(variant, {})
+                        pipeline_timing["by_model"][model_key][variant]["eval_sec"] = ev.get("duration_sec")
+                        pipeline_timing["by_model"][model_key][variant]["eval_timing"] = ev.get("timing")
                         _save_manifest()
                     except KeyboardInterrupt:
                         user_stopped = True
@@ -529,7 +590,14 @@ def main():
                     no_ckpt = os.path.join(root, "saved_models", "no_aug", f"{model_key}_best.pth")
                     aug_ckpt = os.path.join(root, "saved_models", "aug", f"{model_key}_best.pth")
                     if os.path.isfile(no_ckpt) and os.path.isfile(aug_ckpt):
-                        build_visual_comparisons(marida, model_key, root, max_samples=8)
+                        t_step = time.perf_counter()
+                        vis_timing = build_visual_comparisons(marida, model_key, root, max_samples=8)
+                        _record_step(
+                            f"visual_compare/{model_key}",
+                            sec_since(t_step),
+                            model=model_key,
+                            **(vis_timing or {}),
+                        )
                 except Exception as exc:
                     print(f"EROARE comparații vizuale {model_key}: {exc}")
 
@@ -550,7 +618,9 @@ def main():
             comparison_rows.append(row)
 
     if comparison_rows:
+        t_step = time.perf_counter()
         save_comparison_report(comparison_rows, root)
+        _record_step("comparison_report", sec_since(t_step))
 
     overlay_pairs = []
     for variant in ("no_aug", "aug"):
@@ -560,14 +630,33 @@ def main():
                 overlay_pairs.append((f"{EXPERIMENT_SPECS[mk]['display_name']} ({variant})", hist_csv))
     if overlay_pairs:
         try:
+            t_step = time.perf_counter()
             plot_training_curves_overlay(overlay_pairs, os.path.join(root, "results"))
+            _record_step("plot_curves_overlay", sec_since(t_step))
         except Exception:
             pass
 
     final_status = "interrupted_by_user" if user_stopped else "finished"
     manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    pipeline_timing["total_sec"] = sec_since(t_pipeline)
     _save_manifest(final_status)
+
+    timing_report_path = os.path.join(root, "results", "experiment_timing.json")
+    with open(timing_report_path, "w", encoding="utf-8") as f:
+        json.dump(pipeline_timing, f, indent=2)
+
     print(f"\nManifest experiment: {manifest_path}")
+    print(f"Raport timing: {timing_report_path}")
+    print_timing_block("Pipeline experiment (total)", {"total_sec": pipeline_timing["total_sec"]})
+    if pipeline_timing["steps"]:
+        print("\n[timing] Pași:")
+        for entry in pipeline_timing["steps"]:
+            extra = ""
+            if entry.get("duration_sec") is not None and entry["step"].startswith(("train/", "eval/")):
+                inner = entry.get("duration_sec")
+                if inner is not None:
+                    extra = f" (intern: {fmt_duration(inner)})"
+            print(f"  {entry['step']}: {fmt_duration(entry['duration_sec'])}{extra}")
 
     if user_stopped:
         _banner("OPRIT DE UTILIZATOR")

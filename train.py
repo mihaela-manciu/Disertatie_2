@@ -81,6 +81,7 @@ from dataset import (
 )
 from losses import BoundaryLoss, DeepSupervisionHybridLoss, OhemTwoHeadHybridLoss, TwoHeadHybridLoss
 from models import UNetResNet50, TAUNetResNet50, build_model
+from experiment_timing import fmt_duration, print_timing_block, sec_since
 from segmentation_utils import compute_val_miou_foreground
 
 
@@ -432,8 +433,12 @@ def run_training(
 
     print(f"\n{'=' * 60}\nAntrenare: {model_key} | device={device} | two_head={two_head}\n{'=' * 60}")
 
+    t_run = time.perf_counter()
+    timing = {}
+
     cp_prob = preset.get("copy_paste_prob", 0.5)
 
+    t_step = time.perf_counter()
     train_dataset = MARIDADataset(
         marida_path,
         split="train",
@@ -444,10 +449,15 @@ def run_training(
         return_paste_stats=True,
     )
     val_dataset = MARIDADataset(marida_path, split="val", transform=get_validation_augmentation())
+    timing["setup_datasets_sec"] = sec_since(t_step)
 
+    t_step = time.perf_counter()
     sampler = build_debris_weighted_sampler(
         train_dataset, debris_boost=debris_boost, plastic_boost=plastic_boost
     )
+    timing["setup_sampler_sec"] = sec_since(t_step)
+
+    t_step = time.perf_counter()
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -463,6 +473,9 @@ def run_training(
         pin_memory=pin_memory,
     )
 
+    timing["setup_dataloaders_sec"] = sec_since(t_step)
+
+    t_step = time.perf_counter()
     use_ssag = preset.get("use_ssag", False)
     backbone = preset.get("backbone", "ssl4eo")
     model = build_model(
@@ -474,7 +487,9 @@ def run_training(
         use_ssag=use_ssag,
         backbone=backbone,
     ).to(device)
+    timing["setup_model_sec"] = sec_since(t_step)
 
+    t_step = time.perf_counter()
     if preset.get("class_weights_from_data") or preset["class_weights"] == "auto":
         stats = load_channel_stats(marida_path)
         weight_list = get_inverse_freq_weights(stats)
@@ -539,14 +554,19 @@ def run_training(
         scheduler = LinearWarmupCosineScheduler(optimizer, warmup_epochs, epochs)
     else:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    timing["setup_optimizer_sec"] = sec_since(t_step)
 
     best_val_miou = -1.0
     epochs_no_improve = 0
     epochs_ran = 0
     start_epoch = 0
-    istoric = {"train_loss": [], "val_loss": [], "val_miou_fg": [], "lr": []}
+    istoric = {
+        "train_loss": [], "val_loss": [], "val_miou_fg": [], "lr": [],
+        "epoch_sec": [], "train_sec": [], "val_sec": [], "val_miou_sec": [],
+    }
     paste_stats_all = {"pasted_pixels": 0, "total_pixels": 0}
 
+    t_step = time.perf_counter()
     if resume and os.path.isfile(state_path):
         try:
             ckpt = torch.load(state_path, map_location=device)
@@ -557,10 +577,13 @@ def run_training(
             best_val_miou = float(ckpt.get("best_val_miou", -1.0))
             epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
             istoric = ckpt.get("istoric", istoric)
+            for key in ("epoch_sec", "train_sec", "val_sec", "val_miou_sec"):
+                istoric.setdefault(key, [])
             paste_stats_all = ckpt.get("paste_stats_all", paste_stats_all)
             print(f"Resumed from {state_path} at epoch {start_epoch + 1}")
         except Exception as exc:
             print(f"Resume failed ({exc}); starting from scratch.")
+    timing["resume_sec"] = sec_since(t_step)
 
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     stop_file = os.path.join(_script_dir, "STOP")
@@ -584,7 +607,9 @@ def run_training(
             print(f"[warning] State save failed ({exc}).")
 
     interrupted = False
+    t_loop = time.perf_counter()
     for epoch in range(start_epoch, epochs):
+        t_epoch = time.perf_counter()
         epochs_ran = epoch + 1
         print(f"\nEpoch {epoch + 1}/{epochs}")
         lr_curent = scheduler.get_last_lr()[0]
@@ -598,14 +623,26 @@ def run_training(
                 print("Encoder deblocat — fine-tuning complet.")
 
         try:
+            t_train = time.perf_counter()
             train_loss, paste_stats = train_one_epoch(
                 model, train_loader, criterion, optimizer, device,
                 use_amp=use_amp,
                 max_steps=max_steps_per_epoch,
                 grad_accum_steps=grad_accum_steps,
             )
+            train_sec = sec_since(t_train)
+
+            t_val = time.perf_counter()
             val_loss = validate(model, val_loader, criterion, device)
-            val_miou_fg = compute_val_miou_foreground(model, val_loader, device, two_head=two_head)
+            val_part_sec = sec_since(t_val)
+
+            t_miou = time.perf_counter()
+            val_miou_fg = compute_val_miou_foreground(
+                model, val_loader, device, two_head=two_head, verbose=True,
+            )
+            val_miou_sec = sec_since(t_miou)
+            val_sec = round(val_part_sec + val_miou_sec, 2)
+            epoch_sec = sec_since(t_epoch)
         except KeyboardInterrupt:
             print("\n[STOP] Ctrl+C detectat. Salvare stare și oprire…")
             _save_state(epoch)
@@ -617,7 +654,9 @@ def run_training(
 
         print(
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Val mIoU (fg): {val_miou_fg:.4f} | LR: {lr_curent:.6f}"
+            f"Val mIoU (fg): {val_miou_fg:.4f} | LR: {lr_curent:.6f} | "
+            f"Time: train {fmt_duration(train_sec)} val {fmt_duration(val_sec)} "
+            f"(ep {fmt_duration(epoch_sec)})"
         )
 
         if val_miou_fg > best_val_miou:
@@ -635,6 +674,10 @@ def run_training(
         istoric["val_loss"].append(val_loss)
         istoric["val_miou_fg"].append(val_miou_fg)
         istoric["lr"].append(lr_curent)
+        istoric["epoch_sec"].append(epoch_sec)
+        istoric["train_sec"].append(train_sec)
+        istoric["val_sec"].append(val_sec)
+        istoric["val_miou_sec"].append(val_miou_sec)
         scheduler.step()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -656,9 +699,18 @@ def run_training(
             interrupted = True
             break
 
+    timing["training_loop_sec"] = sec_since(t_loop)
+    timing["total_sec"] = sec_since(t_run)
+    if istoric["epoch_sec"]:
+        timing["avg_epoch_sec"] = round(sum(istoric["epoch_sec"]) / len(istoric["epoch_sec"]), 2)
+        timing["sum_train_sec"] = round(sum(istoric["train_sec"]), 2)
+        timing["sum_val_sec"] = round(sum(istoric["val_sec"]), 2)
+
     pd.DataFrame(istoric).to_csv(history_path, index=False)
     print(f"Istoric salvat: {history_path}")
     paste_ratio = paste_stats_all["pasted_pixels"] / max(1, paste_stats_all["total_pixels"])
+
+    print_timing_block(f"Antrenare {model_key}", timing)
 
     return {
         "model_key": model_key,
@@ -683,6 +735,8 @@ def run_training(
             "copy_paste_total_pixels": int(paste_stats_all["total_pixels"]),
             "copy_paste_paste_ratio": float(paste_ratio),
         },
+        "duration_sec": timing["total_sec"],
+        "timing": timing,
     }
 
 

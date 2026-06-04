@@ -1,4 +1,5 @@
 import os
+import time
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "True"
 
@@ -13,6 +14,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import MARIDADataset, get_validation_augmentation, load_channel_stats, NUM_CHANNELS
+from experiment_timing import fmt_duration, print_timing_block, sec_since
 from models import build_model
 from segmentation_utils import (
     CLASE_NUME,
@@ -278,14 +280,18 @@ def evaluate_pipeline(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(results_dir, exist_ok=True)
+    t_run = time.perf_counter()
+    timing = {}
 
     if eval_config_path is None:
         eval_config_path = os.path.join(results_dir, "eval_config.json")
 
+    t_step = time.perf_counter()
     try:
         state = torch.load(model_path, map_location=device, weights_only=True)
     except TypeError:
         state = torch.load(model_path, map_location=device)
+    timing["load_checkpoint_sec"] = sec_since(t_step)
 
     has_two_head = any(k.startswith("debris_head") or k.startswith("type_head") for k in state.keys())
     has_deep_sup = any(k.startswith("aux_head") for k in state.keys())
@@ -297,15 +303,21 @@ def evaluate_pipeline(
                   f"two_head={has_two_head}; folosesc valoarea din checkpoint.")
         two_head = has_two_head
 
+    t_step = time.perf_counter()
     model = build_model(model_key, in_channels=NUM_CHANNELS, two_head=two_head,
                         deep_supervision=has_deep_sup, use_ssag=has_ssag).to(device)
     model.load_state_dict(state)
     model.eval()
+    timing["build_model_sec"] = sec_since(t_step)
 
+    t_step = time.perf_counter()
     val_dataset = MARIDADataset(cale_dataset, split="val", transform=get_validation_augmentation())
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=num_workers)
 
+    timing["setup_val_loader_sec"] = sec_since(t_step)
+
     eval_config = load_eval_config(eval_config_path)
+    t_step = time.perf_counter()
     if eval_config is None and tune_on_val:
         print(f"Calibrare hiperparametri pe setul de validare (fast={fast_tune})...")
         eval_config = tune_thresholds_on_val(
@@ -315,6 +327,7 @@ def evaluate_pipeline(
         )
         save_eval_config(eval_config, eval_config_path)
         print(f"Config salvat: {json.dumps(eval_config, indent=2)}")
+        timing["tune_on_val_sec"] = sec_since(t_step)
     elif eval_config is None:
         eval_config = {
             "decode_mode": "two_head" if two_head else "softmax",
@@ -323,7 +336,11 @@ def evaluate_pipeline(
             "tta_scales": [1.0],
             "use_crf": False,
         }
+        timing["tune_on_val_sec"] = 0.0
+    else:
+        timing["tune_on_val_sec"] = 0.0
 
+    t_step = time.perf_counter()
     test_dataset = MARIDADataset(cale_dataset, split="test", transform=get_validation_augmentation())
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=num_workers)
 
@@ -331,9 +348,12 @@ def evaluate_pipeline(
     ch_mean = np.array(ch_stats["mean"], dtype=np.float64)
     ch_std = np.array(ch_stats["std"], dtype=np.float64)
 
+    timing["setup_test_loader_sec"] = sec_since(t_step)
+
     conf_matrix = np.zeros((4, 4), dtype=np.int64)
     panouri_salvate = 0
 
+    t_step = time.perf_counter()
     for idx, (images, masks) in enumerate(tqdm(test_loader, desc="Evaluating")):
         images = images.to(device)
         mask_raw = masks.numpy().squeeze()
@@ -345,7 +365,9 @@ def evaluate_pipeline(
                 channel_mean=ch_mean, channel_std=ch_std,
             )
             panouri_salvate += 1
+    timing["test_inference_sec"] = sec_since(t_step)
 
+    t_step = time.perf_counter()
     toate_metricile = calculate_metrics(conf_matrix)
     debris_extra = calculate_debris_metrics(conf_matrix)
 
@@ -397,6 +419,14 @@ def evaluate_pipeline(
     fig_cm.savefig(os.path.join(results_dir, f"matrice_confuzie_{safe_name}.png"),
                    dpi=300, facecolor="white", edgecolor="none")
     plt.close(fig_cm)
+    timing["save_reports_sec"] = sec_since(t_step)
+    timing["total_sec"] = sec_since(t_run)
+
+    print_timing_block(f"Evaluare {model_name}", timing)
+
+    timing_path = os.path.join(results_dir, "eval_timing.json")
+    with open(timing_path, "w", encoding="utf-8") as f:
+        json.dump(timing, f, indent=2)
 
     return {
         "model_key": model_key,
@@ -406,6 +436,8 @@ def evaluate_pipeline(
         "eval_config": eval_config,
         "results_dir": results_dir,
         "report_csv": os.path.join(results_dir, f"raport_metrici_{safe_name}.csv"),
+        "duration_sec": timing["total_sec"],
+        "timing": timing,
     }
 
 
