@@ -23,6 +23,66 @@ NUM_CHANNELS = 14   # 11 S2 bands + NDVI + FDI + PI
 
 _STATS_FILENAME = "channel_stats_14ch.json"
 
+_DATA_SCALE_CACHE = {}
+
+
+def _detect_data_scale(root_dir, num_samples=10):
+    """
+    Auto-detect if MARIDA patches store DN values (0-10000) or reflectance
+    (0-1).  Reads a few sample images and checks value ranges.
+    """
+    if root_dir in _DATA_SCALE_CACHE:
+        return _DATA_SCALE_CACHE[root_dir]
+
+    split_file = os.path.join(root_dir, "splits", "train_X.txt")
+    if not os.path.isfile(split_file):
+        _DATA_SCALE_CACHE[root_dir] = 10000.0
+        return 10000.0
+
+    with open(split_file, "r", encoding="utf-8") as f:
+        names = [line.strip() for line in f.readlines()]
+
+    patches_dir = os.path.join(root_dir, "patches")
+    max_vals = []
+
+    for name in names:
+        if len(max_vals) >= num_samples:
+            break
+        name = name.strip()
+        folder = name.rsplit("_", 1)[0]
+        path = os.path.join(patches_dir, folder, f"{name}.tif")
+        if not os.path.exists(path) and not name.startswith("S2_"):
+            path = os.path.join(patches_dir, f"S2_{folder}", f"S2_{name}.tif")
+        if not os.path.exists(path):
+            continue
+        try:
+            with rasterio.open(path) as src:
+                raw = src.read().astype(np.float32)
+            raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+            pos = raw[raw > 0]
+            if len(pos) > 100:
+                max_vals.append(float(np.percentile(pos, 99)))
+        except Exception:
+            continue
+
+    if not max_vals:
+        print("[data scale] Could not sample images; defaulting to DN scaling (/10000)")
+        _DATA_SCALE_CACHE[root_dir] = 10000.0
+        return 10000.0
+
+    p99_median = float(np.median(max_vals))
+    if p99_median > 10.0:
+        scale = 10000.0
+        print(f"[data scale] DN values detected (p99 median={p99_median:.1f}) "
+              f"— dividing by 10000")
+    else:
+        scale = 1.0
+        print(f"[data scale] Reflectance values detected (p99 median={p99_median:.6f}) "
+              f"— no scaling needed")
+
+    _DATA_SCALE_CACHE[root_dir] = scale
+    return scale
+
 
 def _compute_spectral_indices(raw_11ch):
     """
@@ -50,7 +110,10 @@ def compute_channel_stats(root_dir, split="train", max_samples=None):
     """
     Per-channel mean/std for the 14-channel representation.
     Also computes class pixel counts for inverse-frequency weighting.
+    Auto-detects data scale (DN vs reflectance).
     """
+    scale = _detect_data_scale(root_dir)
+
     split_file = os.path.join(root_dir, "splits", f"{split}_X.txt")
     with open(split_file, "r", encoding="utf-8") as f:
         image_names = [line.strip() for line in f.readlines()]
@@ -64,9 +127,11 @@ def compute_channel_stats(root_dir, split="train", max_samples=None):
     channel_sum = np.zeros(NUM_CHANNELS, dtype=np.float64)
     channel_sq_sum = np.zeros(NUM_CHANNELS, dtype=np.float64)
     pixel_count = 0
+    loaded_count = 0
     class_pixel_counts = np.zeros(4, dtype=np.int64)
 
-    print(f"Computing 14-channel statistics from {len(image_names)} {split} images…")
+    print(f"Computing 14-channel statistics from {len(image_names)} {split} images "
+          f"(scale={scale})…")
     for i, img_base in enumerate(image_names):
         img_base = img_base.strip()
         folder_name = img_base.rsplit("_", 1)[0]
@@ -89,7 +154,8 @@ def compute_channel_stats(root_dir, split="train", max_samples=None):
             continue
 
         raw = np.nan_to_num(raw, nan=0.0, posinf=1.0, neginf=0.0)
-        raw = raw / 10000.0
+        if scale != 1.0:
+            raw = raw / scale
         raw = np.clip(raw, 0.0, 1.0)
 
         ndvi, fdi, pi = _compute_spectral_indices(raw)
@@ -99,6 +165,7 @@ def compute_channel_stats(root_dir, split="train", max_samples=None):
         channel_sum += img14.reshape(NUM_CHANNELS, -1).sum(axis=1)
         channel_sq_sum += (img14.reshape(NUM_CHANNELS, -1) ** 2).sum(axis=1)
         pixel_count += n_pixels
+        loaded_count += 1
 
         try:
             with rasterio.open(mask_path) as src:
@@ -114,8 +181,11 @@ def compute_channel_stats(root_dir, split="train", max_samples=None):
         if (i + 1) % 100 == 0:
             print(f"  {i + 1}/{len(image_names)} images processed…")
 
+    if pixel_count == 0:
+        raise RuntimeError(f"No images loaded from {root_dir}. Check patch paths.")
+
     mean = channel_sum / pixel_count
-    std = np.sqrt(channel_sq_sum / pixel_count - mean ** 2)
+    std = np.sqrt(np.maximum(channel_sq_sum / pixel_count - mean ** 2, 0.0))
     std = np.maximum(std, 1e-6)
 
     total_pixels = int(class_pixel_counts.sum())
@@ -125,18 +195,19 @@ def compute_channel_stats(root_dir, split="train", max_samples=None):
         "mean": mean.tolist(),
         "std": std.tolist(),
         "num_channels": NUM_CHANNELS,
+        "data_scale": scale,
         "class_pixel_counts": class_pixel_counts.tolist(),
         "class_frequencies": class_freqs.tolist(),
         "total_pixels": total_pixels,
-        "num_images": len(image_names),
+        "num_images": loaded_count,
     }
 
     out_path = os.path.join(root_dir, _STATS_FILENAME)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
-    print(f"Channel statistics saved to {out_path}")
-    print(f"  Mean: {[f'{m:.4f}' for m in mean]}")
-    print(f"  Std:  {[f'{s:.4f}' for s in std]}")
+    print(f"Channel statistics saved to {out_path} ({loaded_count}/{len(image_names)} images)")
+    print(f"  Mean: {[f'{m:.6f}' for m in mean]}")
+    print(f"  Std:  {[f'{s:.6f}' for s in std]}")
     print(f"  Class freqs: {[f'{fr:.6f}' for fr in class_freqs]}")
     return stats
 
@@ -146,19 +217,31 @@ def load_channel_stats(root_dir):
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as f:
             stats = json.load(f)
-        if stats.get("num_channels", 13) == NUM_CHANNELS:
-            return stats
-        print(f"[stats] Found {stats.get('num_channels')} channels, need {NUM_CHANNELS}. Recomputing…")
+        if stats.get("num_channels", 13) != NUM_CHANNELS:
+            print(f"[stats] Found {stats.get('num_channels')} channels, "
+                  f"need {NUM_CHANNELS}. Recomputing…")
+            return compute_channel_stats(root_dir)
+        detected_scale = _detect_data_scale(root_dir)
+        stored_scale = stats.get("data_scale", 10000.0)
+        if abs(stored_scale - detected_scale) > 0.01:
+            print(f"[stats] Data scale changed ({stored_scale} → {detected_scale}). "
+                  f"Recomputing…")
+            print(f"[stats] WARNING: old checkpoints were trained with wrong "
+                  f"normalization. Use --no-resume to retrain from scratch.")
+            return compute_channel_stats(root_dir)
+        return stats
     return compute_channel_stats(root_dir)
 
 
-def get_inverse_freq_weights(stats, smoothing=0.1):
+def get_inverse_freq_weights(stats, smoothing=0.1, max_weight=50.0):
     freqs = np.array(stats["class_frequencies"], dtype=np.float64)
     freqs = np.maximum(freqs, 1e-6)
     inv = 1.0 / freqs
     inv = inv / inv.sum()
     weights = (1.0 - smoothing) * inv + smoothing * np.ones_like(inv)
     weights = weights / weights.min()
+    if max_weight is not None:
+        weights = np.minimum(weights, max_weight)
     return weights.tolist()
 
 
@@ -257,7 +340,9 @@ class MARIDADataset(Dataset):
             img = src.read().astype(np.float32)
 
         img = np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
-        img = img / 10000.0
+        scale = _detect_data_scale(self.root_dir)
+        if scale != 1.0:
+            img = img / scale
         img = np.clip(img, 0.0, 1.0)
 
         ndvi, fdi, pi = _compute_spectral_indices(img)

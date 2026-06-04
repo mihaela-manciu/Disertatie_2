@@ -63,6 +63,14 @@ def _load_ssl4eo_resnet50(in_channels=14):
             mapped_state[k] = v
 
     msg = resnet.load_state_dict(mapped_state, strict=False)
+    real_missing = [k for k in msg.missing_keys
+                    if k not in ("conv1.weight", "fc.weight", "fc.bias")]
+    if real_missing:
+        print(f"[backbone] WARNING: {len(real_missing)} encoder keys not loaded "
+              f"from SSL4EO: {real_missing[:5]}…")
+    else:
+        print(f"[backbone] All encoder layers loaded from SSL4EO "
+              f"({len(mapped_state)} params)")
     if msg.unexpected_keys:
         print(f"[backbone] Unexpected keys ignored: {msg.unexpected_keys[:5]}")
 
@@ -73,7 +81,7 @@ def _load_ssl4eo_resnet50(in_channels=14):
         full_weights = torch.cat([marida_weights, index_init], dim=1)  # (64, 14, 7, 7)
 
     stem_conv = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    stem_conv.weight.copy_(full_weights)
+    stem_conv.weight = nn.Parameter(full_weights)
     print(f"[backbone] Sentinel-2 stem: mapped 11/13 bands + {in_channels - 11} index channels "
           f"→ conv1 shape {tuple(stem_conv.weight.shape)}")
 
@@ -757,7 +765,8 @@ class TAUNetResNet50(nn.Module):
             self.aux_head2 = nn.Conv2d(256, out_classes, kernel_size=1)
 
     def freeze_encoder(self, freeze=True):
-        for module in (self.encoder0, self.encoder1, self.encoder2):
+        for module in (self.encoder0, self.encoder1, self.encoder2,
+                       self.encoder3, self.encoder4):
             for param in module.parameters():
                 param.requires_grad = not freeze
 

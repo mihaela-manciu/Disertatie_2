@@ -238,7 +238,8 @@ def _decode_batch(model, images, device, two_head=False, debris_threshold=0.5):
 
 
 def compute_val_miou_foreground(model, dataloader, device, two_head=False,
-                                 debris_threshold=0.5, use_tta=False):
+                                 debris_threshold=0.5, use_tta=False,
+                                 postprocess=False):
     model.eval()
     conf_matrix = np.zeros((4, 4), dtype=np.int64)
     with torch.no_grad():
@@ -259,7 +260,9 @@ def compute_val_miou_foreground(model, dataloader, device, two_head=False,
             else:
                 pred = _decode_batch(model, images, device, two_head, debris_threshold)
             for sample_idx in range(pred.shape[0]):
-                p = postprocess_predictions(pred[sample_idx])
+                p = pred[sample_idx]
+                if postprocess:
+                    p = postprocess_predictions(p)
                 update_confusion_matrix(conf_matrix, mask_np[sample_idx], p)
     return calculate_debris_metrics(conf_matrix)["mIoU_foreground"]
 

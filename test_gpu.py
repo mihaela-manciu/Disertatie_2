@@ -6,7 +6,9 @@ print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available:  {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"GPU device:      {torch.cuda.get_device_name(0)}")
-    print(f"GPU memory:      {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+    props = torch.cuda.get_device_properties(0)
+    mem = getattr(props, "total_memory", None) or getattr(props, "total_mem", 0)
+    print(f"GPU memory:      {mem / 1e9:.1f} GB")
 else:
     print("WARNING: No CUDA GPU detected. Training will be very slow on CPU.")
 
