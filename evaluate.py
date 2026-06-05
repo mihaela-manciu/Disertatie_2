@@ -14,7 +14,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import MARIDADataset, get_validation_augmentation, load_channel_stats, NUM_CHANNELS
-from experiment_timing import fmt_duration, print_timing_block, sec_since
+from experiment_timing import fmt_duration, format_timing_dict, print_timing_block, sec_since
+from metrics_reporting import plot_eval_metric_summary, save_metrics_json
 from models import build_model
 from segmentation_utils import (
     CLASE_NUME,
@@ -392,18 +393,37 @@ def evaluate_pipeline(
 
     print("-" * 60)
     print(f"mIoU foreground (1-3): {debris_extra['mIoU_foreground']:.4f}")
+    print(f"MARIDA MD IoU (1+2): {debris_extra.get('marida_md_IoU', debris_extra['binary_debris_IoU']):.4f}")
     print(f"Binary debris IoU (1+2): {debris_extra['binary_debris_IoU']:.4f}")
+    print(f"Plastic recall: {debris_extra.get('plastic_recall', 0.0):.4f}")
     print("=" * 60)
 
     rows_list.append({"Clasa": "mIoU foreground (1-3)", "IoU": debris_extra["mIoU_foreground"],
                       "Precision": np.nan, "Recall": np.nan, "F1-Score": np.nan})
+    rows_list.append({"Clasa": "MARIDA MD IoU (1+2)", "IoU": debris_extra.get(
+        "marida_md_IoU", debris_extra["binary_debris_IoU"]),
+                      "Precision": np.nan, "Recall": np.nan, "F1-Score": np.nan})
     rows_list.append({"Clasa": "Binary debris IoU (1+2)", "IoU": debris_extra["binary_debris_IoU"],
                       "Precision": np.nan, "Recall": np.nan, "F1-Score": np.nan})
+    rows_list.append({"Clasa": "Plastic recall", "IoU": np.nan,
+                      "Precision": np.nan, "Recall": debris_extra.get("plastic_recall", 0.0),
+                      "F1-Score": np.nan})
 
     safe_name = model_key.lower().replace("-", "_")
     df_raport = pd.DataFrame(rows_list)
     df_raport.to_csv(os.path.join(results_dir, f"raport_metrici_{safe_name}.csv"), index=False)
     plot_metrics_bars(toate_metricile, CLASE_NUME, results_dir, model_name)
+    try:
+        thesis_paths = plot_eval_metric_summary(debris_extra, toate_metricile, results_dir, model_name)
+        if thesis_paths:
+            print(f"Thesis metric plots: {', '.join(os.path.basename(p) for p in thesis_paths)}")
+    except Exception as exc:
+        print(f"[warning] plot_eval_metric_summary failed: {exc}")
+
+    save_metrics_json(
+        {"debris_metrics": debris_extra, "per_class": toate_metricile, "eval_config": eval_config},
+        os.path.join(results_dir, "eval_metrics_full.json"),
+    )
 
     fig_cm, ax_cm = plt.subplots(figsize=(8, 7), facecolor="white")
     cm_normalized = conf_matrix.astype("float") / (conf_matrix.sum(axis=1)[:, np.newaxis] + 1e-8)
@@ -421,6 +441,7 @@ def evaluate_pipeline(
     plt.close(fig_cm)
     timing["save_reports_sec"] = sec_since(t_step)
     timing["total_sec"] = sec_since(t_run)
+    timing = format_timing_dict(timing)
 
     print_timing_block(f"Evaluare {model_name}", timing)
 
@@ -437,6 +458,7 @@ def evaluate_pipeline(
         "results_dir": results_dir,
         "report_csv": os.path.join(results_dir, f"raport_metrici_{safe_name}.csv"),
         "duration_sec": timing["total_sec"],
+        "duration_fmt": timing.get("total_fmt", fmt_duration(timing["total_sec"])),
         "timing": timing,
     }
 

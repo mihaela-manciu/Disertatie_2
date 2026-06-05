@@ -71,6 +71,7 @@ def _make_amp_helpers(device, use_amp):
 
 
 from dataset import (
+    MARIDACropMiningDataset,
     MARIDADataset,
     build_debris_weighted_sampler,
     get_training_augmentation,
@@ -79,10 +80,17 @@ from dataset import (
     get_inverse_freq_weights,
     NUM_CHANNELS,
 )
-from losses import BoundaryLoss, DeepSupervisionHybridLoss, OhemTwoHeadHybridLoss, TwoHeadHybridLoss
+from losses import (
+    BoundaryLoss,
+    DeepSupervisionHybridLoss,
+    MDOutlierLoss,
+    OhemTwoHeadHybridLoss,
+    TwoHeadHybridLoss,
+)
+from metrics_reporting import plot_training_dashboard
 from models import UNetResNet50, TAUNetResNet50, build_model
-from experiment_timing import fmt_duration, print_timing_block, sec_since
-from segmentation_utils import compute_val_metrics
+from experiment_timing import fmt_duration, format_timing_dict, print_timing_block, sec_since
+from segmentation_utils import compute_md_outlier_metrics, compute_val_metrics
 from training_stability import MetricEMA, ModelEMA, checkpoint_score, set_training_seed
 
 
@@ -157,9 +165,11 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
         except RuntimeError as exc:
             if steps <= 1:
                 import traceback
+                masks_cpu = masks.detach().cpu()
                 print(
-                    f"\n[train] batch {steps} failed: masks dtype={masks.dtype} "
-                    f"shape={tuple(masks.shape)} min={int(masks.min())} max={int(masks.max())}"
+                    f"\n[train] batch {steps} failed: masks dtype={masks_cpu.dtype} "
+                    f"shape={tuple(masks_cpu.shape)} "
+                    f"min={int(masks_cpu.min())} max={int(masks_cpu.max())}"
                 )
                 traceback.print_exc()
             raise exc
@@ -259,7 +269,21 @@ def validate(model, dataloader, criterion, device):
 def build_criterion(class_weights, two_head, use_ohem, deep_sup_weights, device,
                     *, use_focal=True, lovasz_weight=0.3, label_smoothing=0.0,
                     debris_weight=2.0, type_weight=1.5, seg_weight=0.5,
-                    binary_pos_weight=20.0, focal_gamma=1.5):
+                    binary_pos_weight=20.0, focal_gamma=1.5,
+                    training_mode="standard", binary_lovasz_weight=0.25):
+    if training_mode == "md_outlier":
+        return MDOutlierLoss(
+            class_weight=class_weights,
+            debris_weight=debris_weight,
+            type_weight=type_weight,
+            seg_weight=seg_weight,
+            binary_lovasz_weight=binary_lovasz_weight,
+            deep_sup_weights=deep_sup_weights,
+            use_focal=use_focal,
+            lovasz_weight=lovasz_weight,
+            binary_pos_weight=binary_pos_weight,
+            focal_gamma=focal_gamma,
+        ).to(device)
     if two_head:
         if use_ohem:
             return OhemTwoHeadHybridLoss(
@@ -435,6 +459,53 @@ RECIPE_PRESETS = {
         "seg_weight": 1.0,
         "seed": 42,
     },
+    "md_outlier": {
+        "training_mode": "md_outlier",
+        "class_weights": "auto",
+        "use_focal": True,
+        "lovasz_weight": 0.10,
+        "use_ohem": False,
+        "use_deep_sup": True,
+        "two_head_default": True,
+        "debris_boost": 8.0,
+        "plastic_boost": 30.0,
+        "lr": 1e-4,
+        "decoder_lr_mult": 10.0,
+        "warmup_epochs": 5,
+        "label_smoothing": 0.05,
+        "class_weights_from_data": True,
+        "class_weight_max": 8.0,
+        "freeze_encoder_epochs": 5,
+        "encoder_unfreeze_ramp_epochs": 3,
+        "encoder_lr_ramp_mult": 0.25,
+        "default_epochs": 150,
+        "default_patience": 35,
+        "use_ssag": True,
+        "boundary_weight": 0.05,
+        "grad_accum_steps": 4,
+        "copy_paste_prob": 0.7,
+        "tta_scales_eval": [0.75, 1.0, 1.25],
+        "backbone": "ssl4eo",
+        "ema_decay": 0.999,
+        "metric_ema_decay": 0.85,
+        "checkpoint_md_weight": 0.45,
+        "checkpoint_plastic_weight": 0.30,
+        "checkpoint_plastic_recall_weight": 0.25,
+        "val_debris_threshold": 0.35,
+        "debris_weight": 3.0,
+        "type_weight": 0.25,
+        "seg_weight": 0.25,
+        "binary_lovasz_weight": 0.25,
+        "binary_pos_weight": 15.0,
+        "focal_gamma": 2.0,
+        "crop_mining": True,
+        "crop_size": 128,
+        "crop_prob": 0.5,
+        "plastic_focus_prob": 0.75,
+        "variants": ["no_aug"],
+        "copy_paste_on_no_aug": True,
+        "seed": 42,
+    },
 }
 
 
@@ -445,10 +516,11 @@ def print_recipe_config(recipe: str, preset: dict, *, two_head: bool, model_key:
     print(
         f"[config] build={os.path.basename(os.path.dirname(os.path.abspath(__file__)))} "
         f"recipe={recipe} model={model_key} two_head={two_head} "
+        f"mode={preset.get('training_mode', 'standard')} "
         f"lr={preset.get('lr')} freeze={preset.get('freeze_encoder_epochs')} "
         f"debris_boost={preset.get('debris_boost')} plastic_boost={preset.get('plastic_boost')} "
         f"copy_paste={preset.get('copy_paste_prob')} ema={preset.get('ema_decay', 0)} "
-        f"lovasz={preset.get('lovasz_weight')} "
+        f"lovasz={preset.get('lovasz_weight')} crop_mining={preset.get('crop_mining', False)} "
         f"loss_dtype_guard={dtype_guard}"
     )
     print(f"[config] losses module: {losses_path}")
@@ -539,21 +611,36 @@ def run_training(
     cp_prob = preset.get("copy_paste_prob", 0.5)
 
     t_step = time.perf_counter()
-    train_dataset = MARIDADataset(
+    enable_copy_paste = augmentation_enabled or preset.get("copy_paste_on_no_aug", False)
+    train_base = MARIDADataset(
         marida_path,
         split="train",
         transform=get_training_augmentation(enable=augmentation_enabled),
-        enable_copy_paste=augmentation_enabled,
-        copy_paste_prob=cp_prob,
+        enable_copy_paste=enable_copy_paste,
+        copy_paste_prob=cp_prob if enable_copy_paste else 0.0,
         prefer_plastic=True,
         return_paste_stats=True,
     )
+    if preset.get("crop_mining"):
+        train_dataset = MARIDACropMiningDataset(
+            train_base,
+            crop_size=preset.get("crop_size", 128),
+            crop_prob=preset.get("crop_prob", 0.5),
+            plastic_focus_prob=preset.get("plastic_focus_prob", 0.75),
+        )
+        print(
+            f"[crop_mining] {preset.get('crop_size', 128)}px crops, "
+            f"prob={preset.get('crop_prob', 0.5)}, "
+            f"plastic_focus={preset.get('plastic_focus_prob', 0.75)}"
+        )
+    else:
+        train_dataset = train_base
     val_dataset = MARIDADataset(marida_path, split="val", transform=get_validation_augmentation())
     timing["setup_datasets_sec"] = sec_since(t_step)
 
     t_step = time.perf_counter()
     sampler = build_debris_weighted_sampler(
-        train_dataset, debris_boost=debris_boost, plastic_boost=plastic_boost
+        train_base, debris_boost=debris_boost, plastic_boost=plastic_boost
     )
     timing["setup_sampler_sec"] = sec_since(t_step)
 
@@ -601,6 +688,7 @@ def run_training(
 
     class_weights = torch.tensor(weight_list, dtype=torch.float32).to(device)
     label_smoothing = preset.get("label_smoothing", 0.0)
+    training_mode = preset.get("training_mode", "standard")
     base_criterion = build_criterion(
         class_weights, two_head, use_ohem, deep_sup_weights, device,
         use_focal=preset["use_focal"],
@@ -611,6 +699,8 @@ def run_training(
         seg_weight=preset.get("seg_weight", 0.5),
         binary_pos_weight=preset.get("binary_pos_weight", 20.0),
         focal_gamma=preset.get("focal_gamma", 1.5),
+        training_mode=training_mode,
+        binary_lovasz_weight=preset.get("binary_lovasz_weight", 0.25),
     )
 
     boundary_weight = preset.get("boundary_weight", 0.0)
@@ -668,7 +758,10 @@ def run_training(
     ckpt_miou_w = float(preset.get("checkpoint_miou_weight", 0.25))
     ckpt_plastic_w = float(preset.get("checkpoint_plastic_weight", 0.35))
     ckpt_fg_w = float(preset.get("checkpoint_fg_binary_weight", 0.40))
+    ckpt_md_w = preset.get("checkpoint_md_weight")
+    ckpt_plastic_rec_w = preset.get("checkpoint_plastic_recall_weight")
     val_fg_threshold = preset.get("val_fg_threshold", 0.20)
+    val_debris_threshold = preset.get("val_debris_threshold", 0.35)
     encoder_unfreeze_ramp = int(preset.get("encoder_unfreeze_ramp_epochs", 0))
     encoder_lr_ramp_mult = float(preset.get("encoder_lr_ramp_mult", 0.25))
     score_ema = MetricEMA(decay=metric_ema_decay)
@@ -681,9 +774,11 @@ def run_training(
     start_epoch = 0
     istoric = {
         "train_loss": [], "val_loss": [], "val_miou_fg": [], "val_fg_binary_iou": [],
-        "val_plastic_iou": [],
+        "val_md_iou": [], "val_binary_debris_iou": [], "val_plastic_iou": [],
+        "val_plastic_recall": [],
         "val_checkpoint_score": [], "val_checkpoint_score_ema": [], "lr": [],
         "epoch_sec": [], "train_sec": [], "val_sec": [], "val_miou_sec": [],
+        "epoch_fmt": [], "train_fmt": [], "val_fmt": [],
     }
     paste_stats_all = {"pasted_pixels": 0, "total_pixels": 0}
 
@@ -700,7 +795,9 @@ def run_training(
             istoric = ckpt.get("istoric", istoric)
             for key in (
                 "epoch_sec", "train_sec", "val_sec", "val_miou_sec",
-                "val_fg_binary_iou", "val_plastic_iou",
+                "epoch_fmt", "train_fmt", "val_fmt",
+                "val_fg_binary_iou", "val_md_iou", "val_binary_debris_iou",
+                "val_plastic_iou", "val_plastic_recall",
                 "val_checkpoint_score", "val_checkpoint_score_ema",
             ):
                 istoric.setdefault(key, [])
@@ -786,29 +883,45 @@ def run_training(
             val_part_sec = sec_since(t_val)
 
             t_miou = time.perf_counter()
-            # Primary training metrics: live weights + 4-class seg argmax (matches history4).
-            val_metrics = compute_val_metrics(
-                model, val_loader, device, two_head=False,
-                fg_threshold=val_fg_threshold, verbose=True,
-            )
-            if two_head:
-                th_metrics = compute_val_metrics(
-                    model, val_loader, device, two_head=True, verbose=False,
+            if training_mode == "md_outlier":
+                val_metrics = compute_md_outlier_metrics(
+                    model, val_loader, device,
+                    debris_threshold=val_debris_threshold, verbose=True,
                 )
-                print(
-                    f"  [two-head decode] mIoU (fg): {th_metrics['mIoU_foreground']:.4f} | "
-                    f"Plastic IoU: {th_metrics['plastic_IoU']:.4f} | "
-                    f"Fg-bin IoU: {th_metrics['binary_foreground_IoU']:.4f}"
+            else:
+                val_metrics = compute_val_metrics(
+                    model, val_loader, device, two_head=False,
+                    fg_threshold=val_fg_threshold, verbose=True,
                 )
+                if two_head:
+                    th_metrics = compute_val_metrics(
+                        model, val_loader, device, two_head=True, verbose=False,
+                    )
+                    print(
+                        f"  [two-head decode] mIoU (fg): {th_metrics['mIoU_foreground']:.4f} | "
+                        f"Plastic IoU: {th_metrics['plastic_IoU']:.4f} | "
+                        f"Fg-bin IoU: {th_metrics['binary_foreground_IoU']:.4f}"
+                    )
             val_miou_fg = val_metrics["mIoU_foreground"]
             val_plastic_iou = val_metrics["plastic_IoU"]
             val_fg_binary = val_metrics["binary_foreground_IoU"]
-            val_ckpt_score = checkpoint_score(
-                val_metrics,
-                miou_weight=ckpt_miou_w,
-                plastic_weight=ckpt_plastic_w,
-                fg_binary_weight=ckpt_fg_w,
-            )
+            val_md_iou = val_metrics.get("marida_md_IoU", val_metrics.get("binary_debris_IoU", 0.0))
+            val_binary_debris = val_metrics.get("binary_debris_IoU", val_md_iou)
+            val_plastic_recall = val_metrics.get("plastic_recall", 0.0)
+            if ckpt_md_w is not None:
+                val_ckpt_score = checkpoint_score(
+                    val_metrics,
+                    md_weight=float(ckpt_md_w),
+                    plastic_weight=ckpt_plastic_w,
+                    plastic_recall_weight=float(ckpt_plastic_rec_w or 0.0),
+                )
+            else:
+                val_ckpt_score = checkpoint_score(
+                    val_metrics,
+                    miou_weight=ckpt_miou_w,
+                    plastic_weight=ckpt_plastic_w,
+                    fg_binary_weight=ckpt_fg_w,
+                )
             val_ckpt_score_ema = score_ema.update(val_ckpt_score)
             val_miou_sec = sec_since(t_miou)
             val_sec = round(val_part_sec + val_miou_sec, 2)
@@ -825,10 +938,11 @@ def run_training(
         ema_info = ""
         if paste_stats.get("ema_updates"):
             ema_info = f" | EMA steps: {paste_stats['ema_updates']}"
+        md_line = f" | MD IoU: {val_md_iou:.4f}" if training_mode == "md_outlier" else ""
         print(
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Val mIoU (fg): {val_miou_fg:.4f} | Plastic IoU: {val_plastic_iou:.4f} | "
-            f"Fg-bin IoU: {val_fg_binary:.4f} | "
+            f"Val mIoU (fg): {val_miou_fg:.4f} | Plastic IoU: {val_plastic_iou:.4f} "
+            f"(R={val_plastic_recall:.3f}) | Fg-bin IoU: {val_fg_binary:.4f}{md_line} | "
             f"Score: {val_ckpt_score:.4f} (EMA {val_ckpt_score_ema:.4f}) | LR: {lr_curent:.6f}{ema_info} | "
             f"Time: train {fmt_duration(train_sec)} val {fmt_duration(val_sec)} "
             f"(ep {fmt_duration(epoch_sec)})"
@@ -845,11 +959,14 @@ def run_training(
             if model_ema is not None:
                 ema_path = checkpoint_path.replace("_best.pth", "_ema_best.pth")
                 torch.save(model_ema.state_dict(model), ema_path)
-            print(
+            save_msg = (
                 f"*** Salvat (score EMA={best_checkpoint_score_ema:.4f}, "
                 f"mIoU={val_miou_fg:.4f}, plastic={val_plastic_iou:.4f}, "
-                f"fg-bin={val_fg_binary:.4f}) -> {checkpoint_path} ***"
+                f"fg-bin={val_fg_binary:.4f}"
             )
+            if training_mode == "md_outlier":
+                save_msg += f", MD={val_md_iou:.4f}, plastic_R={val_plastic_recall:.3f}"
+            print(f"{save_msg}) -> {checkpoint_path} ***")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -860,7 +977,10 @@ def run_training(
         istoric["val_loss"].append(val_loss)
         istoric["val_miou_fg"].append(val_miou_fg)
         istoric["val_fg_binary_iou"].append(val_fg_binary)
+        istoric["val_md_iou"].append(val_md_iou)
+        istoric["val_binary_debris_iou"].append(val_binary_debris)
         istoric["val_plastic_iou"].append(val_plastic_iou)
+        istoric["val_plastic_recall"].append(val_plastic_recall)
         istoric["val_checkpoint_score"].append(val_ckpt_score)
         istoric["val_checkpoint_score_ema"].append(val_ckpt_score_ema)
         istoric["lr"].append(lr_curent)
@@ -868,6 +988,9 @@ def run_training(
         istoric["train_sec"].append(train_sec)
         istoric["val_sec"].append(val_sec)
         istoric["val_miou_sec"].append(val_miou_sec)
+        istoric["epoch_fmt"].append(fmt_duration(epoch_sec))
+        istoric["train_fmt"].append(fmt_duration(train_sec))
+        istoric["val_fmt"].append(fmt_duration(val_sec))
         scheduler.step()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -898,8 +1021,18 @@ def run_training(
 
     pd.DataFrame(istoric).to_csv(history_path, index=False)
     print(f"Istoric salvat: {history_path}")
+    dashboard_dir = run_dir or saved_models_dir
+    try:
+        dash_paths = plot_training_dashboard(
+            history_path, dashboard_dir, f"{model_key} ({recipe})",
+        )
+        if dash_paths:
+            print(f"Dashboard metrici: {', '.join(os.path.basename(p) for p in dash_paths)}")
+    except Exception as exc:
+        print(f"[warning] plot_training_dashboard failed: {exc}")
     paste_ratio = paste_stats_all["pasted_pixels"] / max(1, paste_stats_all["total_pixels"])
 
+    timing = format_timing_dict(timing)
     print_timing_block(f"Antrenare {model_key}", timing)
 
     return {
@@ -914,6 +1047,7 @@ def run_training(
         "two_head": two_head,
         "use_amp": use_amp,
         "recipe": recipe,
+        "training_mode": training_mode,
         "class_weights": weight_list,
         "use_focal": preset["use_focal"],
         "lovasz_weight": preset["lovasz_weight"],
@@ -928,6 +1062,7 @@ def run_training(
             "copy_paste_paste_ratio": float(paste_ratio),
         },
         "duration_sec": timing["total_sec"],
+        "duration_fmt": timing.get("total_fmt", fmt_duration(timing["total_sec"])),
         "timing": timing,
     }
 
@@ -947,7 +1082,7 @@ def parse_args():
     p.add_argument("--debris-boost", type=float, default=None)
     p.add_argument("--num-workers", type=int, default=6)
     p.add_argument("--pin-memory", action="store_true")
-    p.add_argument("--recipe", type=str, default="pretrained_strong",
+    p.add_argument("--recipe", type=str, default="md_outlier",
                    choices=list(RECIPE_PRESETS.keys()))
     return p.parse_args()
 

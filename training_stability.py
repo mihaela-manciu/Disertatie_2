@@ -70,10 +70,23 @@ def checkpoint_score(
     miou_weight: float = 0.25,
     plastic_weight: float = 0.35,
     fg_binary_weight: float = 0.40,
+    md_weight: float | None = None,
+    plastic_recall_weight: float | None = None,
 ) -> float:
-    """Composite validation score — higher is better (plastic-weighted for thesis target)."""
-    miou = float(metrics.get("mIoU_foreground", 0.0))
+    """Composite validation score — higher is better."""
     plastic = float(metrics.get("plastic_IoU", metrics.get("per_class", {}).get(1, {}).get("IoU", 0.0)))
+    plastic_rec = float(
+        metrics.get("plastic_recall", metrics.get("per_class", {}).get(1, {}).get("Recall", 0.0))
+    )
+    if md_weight is not None:
+        md = float(metrics.get("marida_md_IoU", metrics.get("binary_debris_IoU", 0.0)))
+        pr_w = plastic_recall_weight if plastic_recall_weight is not None else 0.0
+        total_w = md_weight + plastic_weight + pr_w
+        if total_w <= 0:
+            return md
+        return (md_weight * md + plastic_weight * plastic + pr_w * plastic_rec) / total_w
+
+    miou = float(metrics.get("mIoU_foreground", 0.0))
     fg_bin = float(metrics.get("binary_foreground_IoU", metrics.get("binary_debris_IoU", 0.0)))
     total_w = miou_weight + plastic_weight + fg_binary_weight
     if total_w <= 0:

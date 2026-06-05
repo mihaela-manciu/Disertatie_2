@@ -1,12 +1,13 @@
 """
 Automated MARIDA segmentation experiments — Disertatie_2 (14ch + pretrained backbone).
 
-Default model: taunet_resnet50 with pretrained_strong recipe.
-Target: 0.65–0.73 MARIDA MD IoU via pretrained encoder + SSAGv2 + 14ch + rarity sampling.
+Default: taunet_resnet50 with md_outlier recipe (outlier-first binary MD + type refinement).
+Thesis targets (discussion.pdf): MD IoU ~0.35–0.55, plastic IoU ~0.15–0.25, mIoU fg ~0.35–0.42.
 
 Usage:
   python run_experiments.py --marida "D:\\TAID\\Disertatie\\MARIDA"
-  python run_experiments.py --models taunet_resnet50,taunet --recipe pretrained_strong
+  python run_experiments.py --models taunet_resnet50 --recipe md_outlier --no-resume
+  python run_experiments.py --recipe pretrained_strong  # legacy single-head ablation
   python run_experiments.py --skip-train --skip-eval  # only build comparison
 """
 
@@ -26,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from evaluate import evaluate_pipeline, plot_training_curves, plot_training_curves_overlay
+from metrics_reporting import plot_benchmark_comparison, plot_training_dashboard
 from dataset import MARIDADataset, get_validation_augmentation, load_channel_stats, NUM_CHANNELS
 from models import build_model
 from segmentation_utils import _eval_batch
@@ -180,6 +182,7 @@ def train_experiment_variant(
     train_result["wall_duration_sec"] = round(time.time() - t0, 1)
     if "duration_sec" not in train_result:
         train_result["duration_sec"] = train_result["wall_duration_sec"]
+    train_result["wall_duration_fmt"] = fmt_duration(train_result["wall_duration_sec"])
 
     os.makedirs(run_dir, exist_ok=True)
     with open(os.path.join(run_dir, "train_summary.json"), "w", encoding="utf-8") as f:
@@ -302,14 +305,21 @@ def build_comparison_row(model_key, root, train_info, eval_info):
                 state = torch.load(ckpt, map_location="cpu")
             two_head_used = _detect_two_head(state)
 
+    variant = (train_info or {}).get("variant") or eval_info.get("variant", "")
+    label = f"{spec['display_name']} ({variant})" if variant else spec["display_name"]
     row = {
         "model_key": model_key,
         "display_name": spec["display_name"],
+        "variant": variant,
+        "label": label,
         "two_head": two_head_used,
         "checkpoint": (train_info or {}).get("checkpoint_path", paths["checkpoint"]),
         "results_dir": eval_info["results_dir"],
         "mIoU_foreground": debris["mIoU_foreground"],
         "binary_debris_IoU": debris["binary_debris_IoU"],
+        "marida_md_IoU": debris.get("marida_md_IoU", debris["binary_debris_IoU"]),
+        "plastic_IoU": debris.get("plastic_IoU", per_class.get(1, {}).get("IoU", 0.0)),
+        "plastic_recall": debris.get("plastic_recall", per_class.get(1, {}).get("Recall", 0.0)),
     }
     for c in range(4):
         row[f"IoU_class_{c}"] = per_class[c]["IoU"]
@@ -320,12 +330,17 @@ def build_comparison_row(model_key, root, train_info, eval_info):
         row["best_val_miou_fg"] = train_info.get("best_val_miou_fg")
         row["train_epochs_ran"] = train_info.get("epochs_ran")
         row["train_duration_sec"] = train_info.get("duration_sec")
+        row["train_duration_fmt"] = train_info.get("duration_fmt")
         if train_info.get("timing"):
             row["train_avg_epoch_sec"] = train_info["timing"].get("avg_epoch_sec")
+            row["train_avg_epoch_fmt"] = train_info["timing"].get("avg_epoch_fmt")
     row["eval_duration_sec"] = eval_info.get("duration_sec")
+    row["eval_duration_fmt"] = eval_info.get("duration_fmt")
     if eval_info.get("timing"):
         row["eval_tune_sec"] = eval_info["timing"].get("tune_on_val_sec")
+        row["eval_tune_fmt"] = eval_info["timing"].get("tune_on_val_fmt")
         row["eval_test_sec"] = eval_info["timing"].get("test_inference_sec")
+        row["eval_test_fmt"] = eval_info["timing"].get("test_inference_fmt")
     return row
 
 
@@ -369,9 +384,19 @@ def save_comparison_report(rows, root):
     fig.savefig(chart_path, dpi=300, facecolor="white", edgecolor="none")
     plt.close(fig)
 
+    try:
+        bench_path = plot_benchmark_comparison(rows, os.path.join(root, "results"))
+        if bench_path:
+            print(f"Benchmark comparison: {bench_path}")
+    except Exception as exc:
+        print(f"[warning] plot_benchmark_comparison failed: {exc}")
+
     _banner("RAPORT COMPARATIV")
-    print(df[["display_name", "mIoU_foreground", "binary_debris_IoU",
-              "IoU_class_1", "IoU_class_2", "IoU_class_3"]].to_string(index=False))
+    cols = [c for c in [
+        "display_name", "variant", "marida_md_IoU", "plastic_IoU", "plastic_recall",
+        "mIoU_foreground", "binary_debris_IoU", "IoU_class_1", "IoU_class_2", "IoU_class_3",
+    ] if c in df.columns]
+    print(df[cols].to_string(index=False))
     print(f"\nSalvat: {csv_path}")
     return csv_path
 
@@ -385,7 +410,7 @@ def parse_args():
     p.add_argument("--patience", type=int, default=35)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--debris-boost", type=float, default=None)
-    p.add_argument("--recipe", type=str, default="pretrained_strong",
+    p.add_argument("--recipe", type=str, default="md_outlier",
                    choices=list(RECIPE_PRESETS.keys()))
     two_head_grp = p.add_mutually_exclusive_group()
     two_head_grp.add_argument("--two-head", action="store_true")
@@ -466,24 +491,34 @@ def main():
     print(f"Recipe: {args.recipe} | Input channels: {NUM_CHANNELS}")
     preset = RECIPE_PRESETS[args.recipe]
     print(
-        f"[config] {args.recipe} expects: two_head={preset.get('two_head_default')} "
+        f"[config] {args.recipe} expects: mode={preset.get('training_mode', 'standard')} "
+        f"two_head={preset.get('two_head_default')} "
         f"lr={preset.get('lr')} freeze={preset.get('freeze_encoder_epochs')} "
         f"plastic_boost={preset.get('plastic_boost')} lovasz={preset.get('lovasz_weight')} "
-        f"val_thr={preset.get('val_fg_threshold', 0)}"
+        f"crop_mining={preset.get('crop_mining', False)} "
+        f"variants={preset.get('variants', ['no_aug', 'aug'])}"
     )
-    if preset.get("two_head_default") and not args.no_two_head:
+    if preset.get("training_mode") == "md_outlier":
+        print("[config] Outlier-first MARIDA MD pipeline — binary debris head primary, no_aug only")
+    elif preset.get("two_head_default") and not args.no_two_head:
         print("[config] Two-head training ENABLED (ablation — use pretrained_strong for single-head)")
     else:
-        print("[config] Single-head 4-class seg (history4 recipe) — two-head at eval via --two-head")
+        print("[config] Single-head 4-class seg (history4 recipe)")
 
     do_resume = not args.no_resume
-    train_results = {"no_aug": {}, "aug": {}}
-    eval_results = {"no_aug": {}, "aug": {}}
+    recipe_variants = tuple(preset.get("variants", ("no_aug", "aug")))
+    train_results = {v: {} for v in recipe_variants}
+    eval_results = {v: {} for v in recipe_variants}
     pipeline_timing = {"steps": [], "by_model": {}}
     t_pipeline = time.perf_counter()
 
     def _record_step(step_name, duration_sec, **extra):
-        entry = {"step": step_name, "duration_sec": round(float(duration_sec), 2), **extra}
+        entry = {
+            "step": step_name,
+            "duration_sec": round(float(duration_sec), 2),
+            "duration_fmt": fmt_duration(duration_sec),
+            **extra,
+        }
         pipeline_timing["steps"].append(entry)
         print(f"[timing] {step_name}: {fmt_duration(duration_sec)}")
 
@@ -516,7 +551,7 @@ def main():
             _banner(f"MODEL: {spec['display_name']} ({model_key})")
 
             if not args.skip_train:
-                for variant in ("no_aug", "aug"):
+                for variant in recipe_variants:
                     try:
                         t_step = time.perf_counter()
                         result = train_experiment_variant(
@@ -541,6 +576,9 @@ def main():
                                 t_plot = time.perf_counter()
                                 plot_training_curves(hist_csv, curve_dir,
                                                     f"{spec['display_name']} ({variant})")
+                                plot_training_dashboard(
+                                    hist_csv, curve_dir, f"{spec['display_name']} ({variant})",
+                                )
                                 _record_step(
                                     f"plot_curves/{model_key}/{variant}",
                                     sec_since(t_plot),
@@ -566,7 +604,7 @@ def main():
                     break
 
             if not args.skip_eval and not user_stopped:
-                for variant in ("no_aug", "aug"):
+                for variant in recipe_variants:
                     ckpt = os.path.join(root, "saved_models", variant, f"{model_key}_best.pth")
                     if not os.path.isfile(ckpt):
                         print(f"[{model_key}/{variant}] checkpoint lipsă. Evaluare omisă.")
@@ -577,6 +615,7 @@ def main():
                         if args.recipe in (
                             "strong", "strong_two_head",
                             "pretrained_strong", "pretrained_strong_two_head",
+                            "md_outlier",
                         ):
                             fast_tune = False
                         eval_results[variant][model_key] = evaluate_variant(
@@ -622,7 +661,7 @@ def main():
         user_stopped = True
 
     comparison_rows = []
-    for variant in ("no_aug", "aug"):
+    for variant in recipe_variants:
         for mk in model_keys:
             ev = eval_results[variant].get(mk)
             if not ev or "error" in ev:
@@ -640,7 +679,7 @@ def main():
         _record_step("comparison_report", sec_since(t_step))
 
     overlay_pairs = []
-    for variant in ("no_aug", "aug"):
+    for variant in recipe_variants:
         for mk in model_keys:
             hist_csv = os.path.join(root, "results", mk, variant, "istoric_antrenare.csv")
             if os.path.isfile(hist_csv):
@@ -656,6 +695,7 @@ def main():
     final_status = "interrupted_by_user" if user_stopped else "finished"
     manifest["finished_at"] = datetime.now().isoformat(timespec="seconds")
     pipeline_timing["total_sec"] = sec_since(t_pipeline)
+    pipeline_timing["total_fmt"] = fmt_duration(pipeline_timing["total_sec"])
     _save_manifest(final_status)
 
     timing_report_path = os.path.join(root, "results", "experiment_timing.json")

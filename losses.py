@@ -281,6 +281,88 @@ class BoundaryLoss(nn.Module):
         return torch.stack(batch_loss).mean()
 
 
+def _binary_lovasz_hinge(logits, target_bool):
+    """Lovász hinge for single-channel binary logits (both must be B×H×W)."""
+    if logits.ndim == 4:
+        logits = logits.squeeze(1)
+    if target_bool.ndim == 4:
+        target_bool = target_bool.squeeze(1)
+    prob = torch.sigmoid(logits)
+    fg = target_bool.float()
+    errors = (fg - prob).abs()
+    errors_sorted, perm = torch.sort(errors.reshape(-1), descending=True)
+    fg_sorted = fg.reshape(-1)[perm]
+    if fg_sorted.sum() == 0:
+        return logits.sum() * 0.0
+    grad = _lovasz_grad(fg_sorted)
+    return torch.dot(errors_sorted, grad)
+
+
+class MDOutlierLoss(nn.Module):
+    """
+    Outlier-first MARIDA loss: binary MD detection (debris head) is primary;
+    light 4-class seg + type heads refine plastic / natural / ship on foreground.
+    """
+
+    def __init__(
+        self,
+        class_weight=None,
+        debris_weight=3.0,
+        type_weight=0.5,
+        seg_weight=0.25,
+        binary_lovasz_weight=0.25,
+        deep_sup_weights=None,
+        use_focal=True,
+        lovasz_weight=0.10,
+        binary_pos_weight=15.0,
+        focal_gamma=2.0,
+        ohem_ratio=0.25,
+    ):
+        super().__init__()
+        self.debris_weight = debris_weight
+        self.type_weight = type_weight
+        self.seg_weight = seg_weight
+        self.binary_lovasz_weight = binary_lovasz_weight
+        self.ohem_ratio = ohem_ratio
+        self.seg_loss = HybridLoss(
+            weight=class_weight,
+            use_focal=use_focal,
+            lovasz_weight=lovasz_weight,
+            focal_gamma=focal_gamma,
+        )
+        pos_w = torch.tensor([binary_pos_weight], dtype=torch.float32)
+        self.register_buffer("_pos_weight", pos_w)
+        self.deep_sup_weights = deep_sup_weights or []
+
+    def _md_target(self, target):
+        target = _as_long_target(target, 4)
+        return ((target == 1) | (target == 2)).float().unsqueeze(1)
+
+    def forward(self, outputs, target):
+        target = _as_long_target(target, outputs["seg"].shape[1])
+        md_target = self._md_target(target)
+        debris_logits = outputs["debris"]
+        bce = F.binary_cross_entropy_with_logits(
+            debris_logits, md_target, pos_weight=self._pos_weight,
+        )
+        loss = self.debris_weight * bce
+        if self.binary_lovasz_weight > 0:
+            debris_sq = debris_logits.squeeze(1) if debris_logits.ndim == 4 else debris_logits
+            loss = loss + self.binary_lovasz_weight * _binary_lovasz_hinge(
+                debris_sq, md_target.squeeze(1).bool(),
+            )
+        if self.seg_weight > 0:
+            loss = loss + self.seg_weight * self.seg_loss(outputs["seg"], target)
+        type_labels = _type_labels_from_target(target, outputs["seg"].shape[1])
+        if self.type_weight > 0 and (type_labels != 255).any():
+            loss = loss + self.type_weight * F.cross_entropy(
+                outputs["type"], type_labels, ignore_index=255,
+            )
+        for w, aux_logits in zip(self.deep_sup_weights, outputs.get("aux", [])):
+            loss = loss + w * self.seg_weight * self.seg_loss(aux_logits, target)
+        return loss
+
+
 class OhemTwoHeadHybridLoss(TwoHeadHybridLoss):
     def __init__(self, keep_ratio=0.25, class_weight=None, **kwargs):
         super().__init__(class_weight=class_weight, **kwargs)

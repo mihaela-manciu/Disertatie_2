@@ -453,6 +453,112 @@ class MARIDADataset(Dataset):
         return img_tensor, mask_tensor
 
 
+class MARIDACropMiningDataset(Dataset):
+    """
+    Wraps MARIDADataset and extracts fixed-size crops centered on plastic/debris pixels.
+    Outlier-first training: half the batches see zoomed-in MD regions.
+    """
+
+    def __init__(self, base: MARIDADataset, crop_size: int = 128, crop_prob: float = 0.5,
+                 plastic_focus_prob: float = 0.75):
+        self.base = base
+        self.crop_size = int(crop_size)
+        self.crop_prob = float(crop_prob)
+        self.plastic_focus_prob = float(plastic_focus_prob)
+
+    def __len__(self):
+        return len(self.base)
+
+    def _cache_debris_flags(self):
+        """Delegate to base — used by build_debris_weighted_sampler in main process."""
+        return self.base._cache_debris_flags()
+
+    @property
+    def _debris_flags(self):
+        return self.base._debris_flags
+
+    @property
+    def _plastic_flags(self):
+        return self.base._plastic_flags
+
+    def __getstate__(self):
+        return {
+            "base": self.base,
+            "crop_size": self.crop_size,
+            "crop_prob": self.crop_prob,
+            "plastic_focus_prob": self.plastic_focus_prob,
+        }
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+    def _to_hwc(self, img):
+        if isinstance(img, torch.Tensor):
+            return img.permute(1, 2, 0).numpy()
+        return img
+
+    def _fixed_window(self, img_hwc, mask, y0, x0):
+        """Extract crop_size×crop_size window; pad if the source patch is smaller."""
+        cs = self.crop_size
+        h, w = mask.shape
+        if h >= cs and w >= cs:
+            y0 = int(max(0, min(y0, h - cs)))
+            x0 = int(max(0, min(x0, w - cs)))
+            return (
+                img_hwc[y0:y0 + cs, x0:x0 + cs].copy(),
+                mask[y0:y0 + cs, x0:x0 + cs].copy(),
+            )
+        channels = img_hwc.shape[2] if img_hwc.ndim == 3 else 1
+        out_img = np.zeros((cs, cs, channels), dtype=img_hwc.dtype)
+        out_mask = np.zeros((cs, cs), dtype=mask.dtype)
+        hh, ww = min(h, cs), min(w, cs)
+        out_img[:hh, :ww] = img_hwc[:hh, :ww]
+        out_mask[:hh, :ww] = mask[:hh, :ww]
+        return out_img, out_mask
+
+    def _debris_centered_window(self, img_hwc, mask):
+        cs = self.crop_size
+        h, w = mask.shape
+        if np.any(mask == 1) and random.random() < self.plastic_focus_prob:
+            ys, xs = np.where(mask == 1)
+        elif np.any((mask == 1) | (mask == 2)):
+            ys, xs = np.where((mask == 1) | (mask == 2))
+        else:
+            y0 = random.randint(0, max(0, h - cs)) if h >= cs else 0
+            x0 = random.randint(0, max(0, w - cs)) if w >= cs else 0
+            return self._fixed_window(img_hwc, mask, y0, x0)
+        idx = random.randint(0, len(ys) - 1)
+        cy, cx = int(ys[idx]), int(xs[idx])
+        return self._fixed_window(img_hwc, mask, cy - cs // 2, cx - cs // 2)
+
+    def _random_window(self, img_hwc, mask):
+        cs = self.crop_size
+        h, w = mask.shape
+        y0 = random.randint(0, max(0, h - cs)) if h >= cs else 0
+        x0 = random.randint(0, max(0, w - cs)) if w >= cs else 0
+        return self._fixed_window(img_hwc, mask, y0, x0)
+
+    def __getitem__(self, idx):
+        item = self.base[idx]
+        if len(item) == 3:
+            img, mask, meta = item
+        else:
+            img, mask = item
+            meta = None
+        if self.base.split == "train":
+            img_np = self._to_hwc(img)
+            mask_np = mask.numpy() if isinstance(mask, torch.Tensor) else np.asarray(mask)
+            if random.random() < self.crop_prob:
+                img_np, mask_np = self._debris_centered_window(img_np, mask_np)
+            else:
+                img_np, mask_np = self._random_window(img_np, mask_np)
+            img = torch.from_numpy(img_np.transpose(2, 0, 1).astype(np.float32))
+            mask = torch.from_numpy(mask_np.astype(np.int64)).clamp(0, 3)
+        if meta is not None:
+            return img, mask, meta
+        return img, mask
+
+
 def build_debris_weighted_sampler(dataset, debris_boost=5.0, plastic_boost=10.0):
     """
     Oversample patches with debris; extra-boost patches with plastic.

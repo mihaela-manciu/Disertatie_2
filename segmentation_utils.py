@@ -245,13 +245,27 @@ def calculate_debris_metrics(conf_matrix):
     fg_fn = fg_actual - fg_tp
     binary_foreground_iou = fg_tp / (fg_tp + fg_fp + fg_fn + 1e-8)
 
+    plastic_rec = float(fg_metrics[1]["Recall"])
     return {
         "mIoU_foreground": float(miou_fg),
         "binary_debris_IoU": float(binary_debris_iou),
+        "marida_md_IoU": float(binary_debris_iou),
         "binary_foreground_IoU": float(binary_foreground_iou),
         "plastic_IoU": float(fg_metrics[1]["IoU"]),
+        "plastic_recall": plastic_rec,
         "per_class": fg_metrics,
     }
+
+
+def calculate_md_binary_iou(target, pred_binary):
+    """IoU for MARIDA MD task: classes 1+2 (plastic + natural debris) vs water."""
+    t = np.asarray(target).astype(bool)
+    p = np.asarray(pred_binary).astype(bool)
+    t_md = (t == 1) | (t == 2)
+    tp = np.logical_and(p, t_md).sum()
+    fp = np.logical_and(p, ~t_md).sum()
+    fn = np.logical_and(~p, t_md).sum()
+    return float(tp / (tp + fp + fn + 1e-8))
 
 
 def _decode_batch(model, images, device, two_head=False, debris_threshold=0.5,
@@ -316,9 +330,22 @@ def compute_val_metrics(model, dataloader, device, two_head=False,
         for c in range(1, 4):
             m = per_class[c]
             print(f"  {CLASE_NUME[c]}: IoU={m['IoU']:.4f}  P={m['Precision']:.3f}  R={m['Recall']:.3f}  F1={m['F1-Score']:.3f}")
-        print(f"  Binary debris IoU (1+2): {debris_metrics['binary_debris_IoU']:.4f}")
+        print(f"  MARIDA MD IoU (1+2): {debris_metrics['marida_md_IoU']:.4f}")
+        print(f"  Plastic IoU: {debris_metrics['plastic_IoU']:.4f}  "
+              f"R={debris_metrics['plastic_recall']:.3f}")
         print(f"  Binary foreground IoU (1+2+3): {debris_metrics['binary_foreground_IoU']:.4f}")
     return debris_metrics
+
+
+def compute_md_outlier_metrics(
+    model, dataloader, device, debris_threshold=0.35, verbose=True,
+):
+    """Validation for outlier-first training: two-head decode + MD binary stats."""
+    return compute_val_metrics(
+        model, dataloader, device,
+        two_head=True, debris_threshold=debris_threshold,
+        verbose=verbose,
+    )
 
 
 def compute_val_miou_foreground(model, dataloader, device, two_head=False,
