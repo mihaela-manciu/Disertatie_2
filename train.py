@@ -364,35 +364,75 @@ RECIPE_PRESETS = {
     "pretrained_strong": {
         "class_weights": "auto",
         "use_focal": True,
-        "lovasz_weight": 0.10,
+        "lovasz_weight": 0.20,
         "use_ohem": False,
         "use_deep_sup": True,
-        "two_head_default": True,
-        "debris_boost": 8.0,
-        "plastic_boost": 20.0,
-        "lr": 5e-5,
+        "two_head_default": False,
+        "debris_boost": 5.0,
+        "plastic_boost": 12.0,
+        "lr": 1e-4,
         "decoder_lr_mult": 10.0,
-        "warmup_epochs": 8,
+        "warmup_epochs": 5,
         "label_smoothing": 0.05,
         "class_weights_from_data": True,
-        "freeze_encoder_epochs": 8,
+        "class_weight_max": 8.0,
+        "freeze_encoder_epochs": 5,
+        "encoder_unfreeze_ramp_epochs": 3,
+        "encoder_lr_ramp_mult": 0.25,
         "default_epochs": 150,
         "default_patience": 35,
         "use_ssag": True,
-        "boundary_weight": 0.0,
+        "boundary_weight": 0.1,
         "grad_accum_steps": 4,
         "copy_paste_prob": 0.4,
         "tta_scales_eval": [0.75, 1.0, 1.25],
         "backbone": "ssl4eo",
         "ema_decay": 0.999,
         "metric_ema_decay": 0.85,
-        "checkpoint_miou_weight": 0.4,
-        "checkpoint_fg_binary_weight": 0.6,
-        "binary_pos_weight": 25.0,
-        "focal_gamma": 1.5,
-        "debris_weight": 2.5,
-        "type_weight": 2.0,
-        "seg_weight": 0.8,
+        "checkpoint_miou_weight": 0.25,
+        "checkpoint_plastic_weight": 0.35,
+        "checkpoint_fg_binary_weight": 0.40,
+        "val_fg_threshold": 0.20,
+        "focal_gamma": 2.0,
+        "seed": 42,
+    },
+    "pretrained_strong_two_head": {
+        "class_weights": "auto",
+        "use_focal": True,
+        "lovasz_weight": 0.20,
+        "use_ohem": False,
+        "use_deep_sup": True,
+        "two_head_default": True,
+        "debris_boost": 5.0,
+        "plastic_boost": 12.0,
+        "lr": 1e-4,
+        "decoder_lr_mult": 10.0,
+        "warmup_epochs": 5,
+        "label_smoothing": 0.05,
+        "class_weights_from_data": True,
+        "class_weight_max": 8.0,
+        "freeze_encoder_epochs": 5,
+        "encoder_unfreeze_ramp_epochs": 3,
+        "encoder_lr_ramp_mult": 0.25,
+        "default_epochs": 150,
+        "default_patience": 35,
+        "use_ssag": True,
+        "boundary_weight": 0.1,
+        "grad_accum_steps": 4,
+        "copy_paste_prob": 0.4,
+        "tta_scales_eval": [0.75, 1.0, 1.25],
+        "backbone": "ssl4eo",
+        "ema_decay": 0.999,
+        "metric_ema_decay": 0.85,
+        "checkpoint_miou_weight": 0.25,
+        "checkpoint_plastic_weight": 0.35,
+        "checkpoint_fg_binary_weight": 0.40,
+        "val_fg_threshold": 0.20,
+        "binary_pos_weight": 10.0,
+        "focal_gamma": 2.0,
+        "debris_weight": 1.0,
+        "type_weight": 0.5,
+        "seg_weight": 1.0,
         "seed": 42,
     },
 }
@@ -552,7 +592,9 @@ def run_training(
     t_step = time.perf_counter()
     if preset.get("class_weights_from_data") or preset["class_weights"] == "auto":
         stats = load_channel_stats(marida_path)
-        weight_list = get_inverse_freq_weights(stats)
+        weight_list = get_inverse_freq_weights(
+            stats, max_weight=preset.get("class_weight_max", 50.0),
+        )
         print(f"[recipe={recipe}] data-driven class weights: {[f'{w:.2f}' for w in weight_list]}")
     else:
         weight_list = preset["class_weights"]
@@ -606,8 +648,8 @@ def run_training(
         decoder_params = list(model.decoder_parameters())
         decoder_lr = lr * decoder_lr_mult
         param_groups = [
-            {"params": encoder_params, "lr": lr},
-            {"params": decoder_params, "lr": decoder_lr},
+            {"params": encoder_params, "lr": lr, "group": "encoder"},
+            {"params": decoder_params, "lr": decoder_lr, "group": "decoder"},
         ]
         optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
         print(f"[optimizer] Differential LR: encoder={lr:.1e}, decoder={decoder_lr:.1e} "
@@ -623,8 +665,12 @@ def run_training(
 
     ema_decay = float(preset.get("ema_decay", 0.999))
     metric_ema_decay = float(preset.get("metric_ema_decay", 0.85))
-    ckpt_miou_w = float(preset.get("checkpoint_miou_weight", 0.4))
-    ckpt_fg_w = float(preset.get("checkpoint_fg_binary_weight", 0.6))
+    ckpt_miou_w = float(preset.get("checkpoint_miou_weight", 0.25))
+    ckpt_plastic_w = float(preset.get("checkpoint_plastic_weight", 0.35))
+    ckpt_fg_w = float(preset.get("checkpoint_fg_binary_weight", 0.40))
+    val_fg_threshold = preset.get("val_fg_threshold", 0.20)
+    encoder_unfreeze_ramp = int(preset.get("encoder_unfreeze_ramp_epochs", 0))
+    encoder_lr_ramp_mult = float(preset.get("encoder_lr_ramp_mult", 0.25))
     score_ema = MetricEMA(decay=metric_ema_decay)
 
     best_val_miou = -1.0
@@ -635,6 +681,7 @@ def run_training(
     start_epoch = 0
     istoric = {
         "train_loss": [], "val_loss": [], "val_miou_fg": [], "val_fg_binary_iou": [],
+        "val_plastic_iou": [],
         "val_checkpoint_score": [], "val_checkpoint_score_ema": [], "lr": [],
         "epoch_sec": [], "train_sec": [], "val_sec": [], "val_miou_sec": [],
     }
@@ -653,7 +700,8 @@ def run_training(
             istoric = ckpt.get("istoric", istoric)
             for key in (
                 "epoch_sec", "train_sec", "val_sec", "val_miou_sec",
-                "val_fg_binary_iou", "val_checkpoint_score", "val_checkpoint_score_ema",
+                "val_fg_binary_iou", "val_plastic_iou",
+                "val_checkpoint_score", "val_checkpoint_score_ema",
             ):
                 istoric.setdefault(key, [])
             best_checkpoint_score = float(ckpt.get("best_checkpoint_score", best_checkpoint_score))
@@ -705,6 +753,22 @@ def run_training(
             elif epoch == freeze_enc_epochs:
                 model.freeze_encoder(False)
                 print("Encoder deblocat — fine-tuning complet.")
+                if encoder_unfreeze_ramp > 0:
+                    for pg in optimizer.param_groups:
+                        if pg.get("group") == "encoder":
+                            pg["lr"] = lr * encoder_lr_ramp_mult
+                    print(
+                        f"[optimizer] Encoder LR ramp: {lr * encoder_lr_ramp_mult:.1e} "
+                        f"for {encoder_unfreeze_ramp} epochs"
+                    )
+            elif (
+                encoder_unfreeze_ramp > 0
+                and epoch == freeze_enc_epochs + encoder_unfreeze_ramp
+            ):
+                for pg in optimizer.param_groups:
+                    if pg.get("group") == "encoder":
+                        pg["lr"] = lr
+                print(f"[optimizer] Encoder LR restored to {lr:.1e}")
 
         try:
             t_train = time.perf_counter()
@@ -724,7 +788,8 @@ def run_training(
             t_miou = time.perf_counter()
             # Primary training metrics: live weights + 4-class seg argmax (matches history4).
             val_metrics = compute_val_metrics(
-                model, val_loader, device, two_head=False, verbose=True,
+                model, val_loader, device, two_head=False,
+                fg_threshold=val_fg_threshold, verbose=True,
             )
             if two_head:
                 th_metrics = compute_val_metrics(
@@ -732,12 +797,17 @@ def run_training(
                 )
                 print(
                     f"  [two-head decode] mIoU (fg): {th_metrics['mIoU_foreground']:.4f} | "
+                    f"Plastic IoU: {th_metrics['plastic_IoU']:.4f} | "
                     f"Fg-bin IoU: {th_metrics['binary_foreground_IoU']:.4f}"
                 )
             val_miou_fg = val_metrics["mIoU_foreground"]
+            val_plastic_iou = val_metrics["plastic_IoU"]
             val_fg_binary = val_metrics["binary_foreground_IoU"]
             val_ckpt_score = checkpoint_score(
-                val_metrics, miou_weight=ckpt_miou_w, fg_binary_weight=ckpt_fg_w,
+                val_metrics,
+                miou_weight=ckpt_miou_w,
+                plastic_weight=ckpt_plastic_w,
+                fg_binary_weight=ckpt_fg_w,
             )
             val_ckpt_score_ema = score_ema.update(val_ckpt_score)
             val_miou_sec = sec_since(t_miou)
@@ -757,7 +827,8 @@ def run_training(
             ema_info = f" | EMA steps: {paste_stats['ema_updates']}"
         print(
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Val mIoU (fg): {val_miou_fg:.4f} | Fg-bin IoU: {val_fg_binary:.4f} | "
+            f"Val mIoU (fg): {val_miou_fg:.4f} | Plastic IoU: {val_plastic_iou:.4f} | "
+            f"Fg-bin IoU: {val_fg_binary:.4f} | "
             f"Score: {val_ckpt_score:.4f} (EMA {val_ckpt_score_ema:.4f}) | LR: {lr_curent:.6f}{ema_info} | "
             f"Time: train {fmt_duration(train_sec)} val {fmt_duration(val_sec)} "
             f"(ep {fmt_duration(epoch_sec)})"
@@ -776,7 +847,8 @@ def run_training(
                 torch.save(model_ema.state_dict(model), ema_path)
             print(
                 f"*** Salvat (score EMA={best_checkpoint_score_ema:.4f}, "
-                f"mIoU={val_miou_fg:.4f}, fg-bin={val_fg_binary:.4f}) -> {checkpoint_path} ***"
+                f"mIoU={val_miou_fg:.4f}, plastic={val_plastic_iou:.4f}, "
+                f"fg-bin={val_fg_binary:.4f}) -> {checkpoint_path} ***"
             )
         else:
             epochs_no_improve += 1
@@ -788,6 +860,7 @@ def run_training(
         istoric["val_loss"].append(val_loss)
         istoric["val_miou_fg"].append(val_miou_fg)
         istoric["val_fg_binary_iou"].append(val_fg_binary)
+        istoric["val_plastic_iou"].append(val_plastic_iou)
         istoric["val_checkpoint_score"].append(val_ckpt_score)
         istoric["val_checkpoint_score_ema"].append(val_ckpt_score_ema)
         istoric["lr"].append(lr_curent)

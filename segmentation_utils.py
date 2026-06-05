@@ -138,6 +138,25 @@ def decode_softmax(seg_probs):
     return torch.argmax(seg_probs, dim=0).cpu().numpy()
 
 
+def decode_seg_confidence(seg_probs, fg_threshold=0.20):
+    """Foreground only when max class prob >= threshold; else water (MARIDA imbalance)."""
+    if not torch.is_tensor(seg_probs):
+        seg_probs = torch.as_tensor(seg_probs)
+    batched = seg_probs.ndim == 4
+    if not batched:
+        seg_probs = seg_probs.unsqueeze(0)
+    fg_probs = seg_probs[:, 1:4]
+    fg_max, fg_cls = fg_probs.max(dim=1)
+    pred = torch.zeros(
+        seg_probs.shape[0], seg_probs.shape[2], seg_probs.shape[3],
+        dtype=torch.long, device=seg_probs.device,
+    )
+    fg_mask = fg_max >= fg_threshold
+    pred[fg_mask] = fg_cls[fg_mask] + 1
+    out = pred.cpu().numpy()
+    return out if batched else out[0]
+
+
 def decode_thresholds(probs, thresholds):
     h, w = probs.shape[1], probs.shape[2]
     preds = np.zeros((h, w), dtype=np.int64)
@@ -230,11 +249,13 @@ def calculate_debris_metrics(conf_matrix):
         "mIoU_foreground": float(miou_fg),
         "binary_debris_IoU": float(binary_debris_iou),
         "binary_foreground_IoU": float(binary_foreground_iou),
+        "plastic_IoU": float(fg_metrics[1]["IoU"]),
         "per_class": fg_metrics,
     }
 
 
-def _decode_batch(model, images, device, two_head=False, debris_threshold=0.5):
+def _decode_batch(model, images, device, two_head=False, debris_threshold=0.5,
+                  fg_threshold=None):
     out = model_forward(model, images)
     if two_head:
         seg_p = torch.softmax(out["seg"], dim=1)
@@ -242,14 +263,19 @@ def _decode_batch(model, images, device, two_head=False, debris_threshold=0.5):
         type_p = torch.softmax(out["type"], dim=1)
         pred = decode_two_head(seg_p, debris_p, type_p, debris_threshold)
     else:
-        pred = decode_softmax(torch.softmax(out["seg"], dim=1))
+        seg_p = torch.softmax(out["seg"], dim=1)
+        if fg_threshold is not None and fg_threshold > 0:
+            pred = decode_seg_confidence(seg_p, fg_threshold=fg_threshold)
+        else:
+            pred = decode_softmax(seg_p)
     if pred.ndim == 2:
         pred = pred[None, ...]
     return pred
 
 
 def compute_val_metrics(model, dataloader, device, two_head=False,
-                        debris_threshold=0.5, use_tta=False, postprocess=False, verbose=True):
+                        debris_threshold=0.5, fg_threshold=None,
+                        use_tta=False, postprocess=False, verbose=True):
     model.eval()
     conf_matrix = np.zeros((4, 4), dtype=np.int64)
     with torch.no_grad():
@@ -268,7 +294,9 @@ def compute_val_metrics(model, dataloader, device, two_head=False,
                 if pred.ndim == 2:
                     pred = pred[None, ...]
             else:
-                pred = _decode_batch(model, images, device, two_head, debris_threshold)
+                pred = _decode_batch(
+                    model, images, device, two_head, debris_threshold, fg_threshold,
+                )
             for sample_idx in range(pred.shape[0]):
                 p = pred[sample_idx]
                 if postprocess:
@@ -278,7 +306,12 @@ def compute_val_metrics(model, dataloader, device, two_head=False,
     debris_metrics = calculate_debris_metrics(conf_matrix)
     debris_metrics["per_class"] = per_class
     if verbose:
-        label = "two-head" if two_head else "seg-head"
+        if two_head:
+            label = "two-head"
+        elif fg_threshold is not None and fg_threshold > 0:
+            label = f"seg-thr={fg_threshold:.2f}"
+        else:
+            label = "seg-argmax"
         print(f"  [{label} decode]")
         for c in range(1, 4):
             m = per_class[c]

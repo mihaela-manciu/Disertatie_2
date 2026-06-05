@@ -64,11 +64,21 @@ class ModelEMA:
         model.load_state_dict(backup, strict=True)
 
 
-def checkpoint_score(metrics: dict, *, miou_weight: float = 0.5, fg_binary_weight: float = 0.5) -> float:
-    """Composite validation score — higher is better."""
+def checkpoint_score(
+    metrics: dict,
+    *,
+    miou_weight: float = 0.25,
+    plastic_weight: float = 0.35,
+    fg_binary_weight: float = 0.40,
+) -> float:
+    """Composite validation score — higher is better (plastic-weighted for thesis target)."""
     miou = float(metrics.get("mIoU_foreground", 0.0))
+    plastic = float(metrics.get("plastic_IoU", metrics.get("per_class", {}).get(1, {}).get("IoU", 0.0)))
     fg_bin = float(metrics.get("binary_foreground_IoU", metrics.get("binary_debris_IoU", 0.0)))
-    return miou_weight * miou + fg_binary_weight * fg_bin
+    total_w = miou_weight + plastic_weight + fg_binary_weight
+    if total_w <= 0:
+        return miou
+    return (miou_weight * miou + plastic_weight * plastic + fg_binary_weight * fg_bin) / total_w
 
 
 class MetricEMA:

@@ -466,12 +466,15 @@ def main():
     print(f"Recipe: {args.recipe} | Input channels: {NUM_CHANNELS}")
     preset = RECIPE_PRESETS[args.recipe]
     print(
-        f"[config] pretrained_strong expects: two_head={preset.get('two_head_default')} "
+        f"[config] {args.recipe} expects: two_head={preset.get('two_head_default')} "
         f"lr={preset.get('lr')} freeze={preset.get('freeze_encoder_epochs')} "
-        f"plastic_boost={preset.get('plastic_boost')} ema={preset.get('ema_decay')}"
+        f"plastic_boost={preset.get('plastic_boost')} lovasz={preset.get('lovasz_weight')} "
+        f"val_thr={preset.get('val_fg_threshold', 0)}"
     )
     if preset.get("two_head_default") and not args.no_two_head:
-        print("[config] Two-head + EMA checkpointing ENABLED (verify log shows two_head=True)")
+        print("[config] Two-head training ENABLED (ablation — use pretrained_strong for single-head)")
+    else:
+        print("[config] Single-head 4-class seg (history4 recipe) — two-head at eval via --two-head")
 
     do_resume = not args.no_resume
     train_results = {"no_aug": {}, "aug": {}}
@@ -571,7 +574,10 @@ def main():
                     try:
                         t_step = time.perf_counter()
                         fast_tune = not args.full_tune
-                        if args.recipe in ("strong", "strong_two_head", "pretrained_strong"):
+                        if args.recipe in (
+                            "strong", "strong_two_head",
+                            "pretrained_strong", "pretrained_strong_two_head",
+                        ):
                             fast_tune = False
                         eval_results[variant][model_key] = evaluate_variant(
                             marida, model_key, root, variant=variant,
