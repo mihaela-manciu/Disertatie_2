@@ -118,6 +118,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
     skipped_steps = 0
     pasted_total = 0
     pixels_total = 0
+    ema_updates = 0
     autocast_ctx, scaler = _make_amp_helpers(device, use_amp)
     loop = tqdm(dataloader, desc="Training", leave=False)
     steps = 0
@@ -193,6 +194,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
                     skipped_steps += 1
             if stepped and model_ema is not None:
                 model_ema.update(model)
+                ema_updates += 1
             optimizer.zero_grad(set_to_none=True)
             accum_count = 0
 
@@ -216,6 +218,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
                 stepped = True
         if stepped and model_ema is not None:
             model_ema.update(model)
+            ema_updates += 1
         optimizer.zero_grad(set_to_none=True)
 
     if skipped_steps > 0:
@@ -228,6 +231,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
         "total_pixels": int(pixels_total),
         "paste_ratio": float(paste_ratio),
         "skipped_batches": int(skipped_steps),
+        "ema_updates": int(ema_updates),
     }
 
 
@@ -388,7 +392,7 @@ RECIPE_PRESETS = {
         "focal_gamma": 1.5,
         "debris_weight": 2.5,
         "type_weight": 2.0,
-        "seg_weight": 0.4,
+        "seg_weight": 0.8,
         "seed": 42,
     },
 }
@@ -718,17 +722,17 @@ def run_training(
             val_part_sec = sec_since(t_val)
 
             t_miou = time.perf_counter()
-            if model_ema is not None:
-                backup = model_ema.apply(model)
-                try:
-                    val_metrics = compute_val_metrics(
-                        model, val_loader, device, two_head=two_head, verbose=True,
-                    )
-                finally:
-                    ModelEMA.restore(model, backup)
-            else:
-                val_metrics = compute_val_metrics(
-                    model, val_loader, device, two_head=two_head, verbose=True,
+            # Primary training metrics: live weights + 4-class seg argmax (matches history4).
+            val_metrics = compute_val_metrics(
+                model, val_loader, device, two_head=False, verbose=True,
+            )
+            if two_head:
+                th_metrics = compute_val_metrics(
+                    model, val_loader, device, two_head=True, verbose=False,
+                )
+                print(
+                    f"  [two-head decode] mIoU (fg): {th_metrics['mIoU_foreground']:.4f} | "
+                    f"Fg-bin IoU: {th_metrics['binary_foreground_IoU']:.4f}"
                 )
             val_miou_fg = val_metrics["mIoU_foreground"]
             val_fg_binary = val_metrics["binary_foreground_IoU"]
@@ -748,10 +752,13 @@ def run_training(
         paste_stats_all["pasted_pixels"] += paste_stats["pasted_pixels"]
         paste_stats_all["total_pixels"] += paste_stats["total_pixels"]
 
+        ema_info = ""
+        if paste_stats.get("ema_updates"):
+            ema_info = f" | EMA steps: {paste_stats['ema_updates']}"
         print(
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
             f"Val mIoU (fg): {val_miou_fg:.4f} | Fg-bin IoU: {val_fg_binary:.4f} | "
-            f"Score: {val_ckpt_score:.4f} (EMA {val_ckpt_score_ema:.4f}) | LR: {lr_curent:.6f} | "
+            f"Score: {val_ckpt_score:.4f} (EMA {val_ckpt_score_ema:.4f}) | LR: {lr_curent:.6f}{ema_info} | "
             f"Time: train {fmt_duration(train_sec)} val {fmt_duration(val_sec)} "
             f"(ep {fmt_duration(epoch_sec)})"
         )
@@ -763,10 +770,10 @@ def run_training(
             best_checkpoint_score_ema = val_ckpt_score_ema
             best_checkpoint_score = val_ckpt_score
             epochs_no_improve = 0
-            save_state = (
-                model_ema.state_dict(model) if model_ema is not None else model.state_dict()
-            )
-            torch.save(save_state, checkpoint_path)
+            torch.save(model.state_dict(), checkpoint_path)
+            if model_ema is not None:
+                ema_path = checkpoint_path.replace("_best.pth", "_ema_best.pth")
+                torch.save(model_ema.state_dict(model), ema_path)
             print(
                 f"*** Salvat (score EMA={best_checkpoint_score_ema:.4f}, "
                 f"mIoU={val_miou_fg:.4f}, fg-bin={val_fg_binary:.4f}) -> {checkpoint_path} ***"

@@ -149,12 +149,12 @@ def decode_thresholds(probs, thresholds):
 
 
 def decode_two_head(seg_probs, debris_probs, type_probs, debris_threshold=0.5):
+    """Fuse seg + debris/type heads. Debris gate overrides class on flagged pixels."""
     seg_pred = torch.argmax(seg_probs, dim=1)
-    debris_mask = (debris_probs.squeeze(1) >= debris_threshold)
+    debris_mask = debris_probs.squeeze(1) >= debris_threshold
     type_pred = torch.argmax(type_probs, dim=1) + 1
     refined = seg_pred.clone()
-    refine_mask = debris_mask & (seg_pred == 0)
-    refined[refine_mask] = type_pred[refine_mask]
+    refined[debris_mask] = type_pred[debris_mask]
     return refined.cpu().numpy()
 
 
@@ -276,7 +276,10 @@ def compute_val_metrics(model, dataloader, device, two_head=False,
                 update_confusion_matrix(conf_matrix, mask_np[sample_idx], p)
     per_class = calculate_metrics(conf_matrix)
     debris_metrics = calculate_debris_metrics(conf_matrix)
+    debris_metrics["per_class"] = per_class
     if verbose:
+        label = "two-head" if two_head else "seg-head"
+        print(f"  [{label} decode]")
         for c in range(1, 4):
             m = per_class[c]
             print(f"  {CLASE_NUME[c]}: IoU={m['IoU']:.4f}  P={m['Precision']:.3f}  R={m['Recall']:.3f}  F1={m['F1-Score']:.3f}")
