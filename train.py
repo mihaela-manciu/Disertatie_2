@@ -110,7 +110,8 @@ def _sanitize_batch(images, masks, num_classes=4):
 
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
-                    use_amp=False, max_steps=None, grad_accum_steps=1):
+                    use_amp=False, max_steps=None, grad_accum_steps=1,
+                    model_ema=None):
     model.train()
     running_loss = 0.0
     valid_steps = 0
@@ -176,17 +177,22 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
 
         accum_count += 1
         if accum_count >= grad_accum_steps:
+            stepped = False
             if use_amp:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
+                stepped = True
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 if torch.isfinite(grad_norm):
                     optimizer.step()
+                    stepped = True
                 else:
                     skipped_steps += 1
+            if stepped and model_ema is not None:
+                model_ema.update(model)
             optimizer.zero_grad(set_to_none=True)
             accum_count = 0
 
@@ -196,15 +202,20 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
         loop.set_postfix(loss=loss_val, skip=skipped_steps)
 
     if accum_count > 0:
+        stepped = False
         if use_amp:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            stepped = True
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if torch.isfinite(grad_norm):
                 optimizer.step()
+                stepped = True
+        if stepped and model_ema is not None:
+            model_ema.update(model)
         optimizer.zero_grad(set_to_none=True)
 
     if skipped_steps > 0:
@@ -698,10 +709,9 @@ def run_training(
                 use_amp=use_amp,
                 max_steps=max_steps_per_epoch,
                 grad_accum_steps=grad_accum_steps,
+                model_ema=model_ema,
             )
             train_sec = sec_since(t_train)
-            if model_ema is not None:
-                model_ema.update(model)
 
             t_val = time.perf_counter()
             val_loss = validate(model, val_loader, criterion, device)
