@@ -19,21 +19,44 @@ def set_training_seed(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = True
 
 
+def _ema_trackable(tensor: torch.Tensor) -> bool:
+    """Only float weights/buffers are EMA-blended; BatchNorm counters stay int."""
+    return tensor.is_floating_point()
+
+
 class ModelEMA:
     """Exponential moving average of model weights for stable validation."""
 
     def __init__(self, model: torch.nn.Module, decay: float = 0.999):
         self.decay = decay
-        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        state = model.state_dict()
+        self.shadow = {
+            k: v.detach().clone()
+            for k, v in state.items()
+            if _ema_trackable(v)
+        }
+        skipped = [k for k in state if k not in self.shadow]
+        if skipped:
+            print(f"[ema] Skipping {len(skipped)} non-float state keys (e.g. num_batches_tracked)")
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module) -> None:
         for key, value in model.state_dict().items():
+            if key not in self.shadow:
+                continue
             self.shadow[key].mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+
+    def state_dict(self, model: torch.nn.Module) -> dict:
+        """EMA floats merged with the model's live integer buffers for checkpointing."""
+        merged = {k: v.detach().clone() for k, v in self.shadow.items()}
+        for key, value in model.state_dict().items():
+            if key not in merged:
+                merged[key] = value.detach().clone()
+        return merged
 
     def apply(self, model: torch.nn.Module) -> dict:
         backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        model.load_state_dict(self.shadow, strict=True)
+        model.load_state_dict(self.state_dict(model), strict=True)
         return backup
 
     @staticmethod

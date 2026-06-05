@@ -753,7 +753,9 @@ def run_training(
             best_checkpoint_score_ema = val_ckpt_score_ema
             best_checkpoint_score = val_ckpt_score
             epochs_no_improve = 0
-            save_state = model_ema.shadow if model_ema is not None else model.state_dict()
+            save_state = (
+                model_ema.state_dict(model) if model_ema is not None else model.state_dict()
+            )
             torch.save(save_state, checkpoint_path)
             print(
                 f"*** Salvat (score EMA={best_checkpoint_score_ema:.4f}, "
