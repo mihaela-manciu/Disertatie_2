@@ -47,6 +47,7 @@ def plot_training_dashboard(history_csv: str, save_dir: str, title: str) -> list
         ("val_binary_debris_iou", "Val Binary Debris IoU", "#F58231"),
         ("val_plastic_recall", "Val Plastic Recall", "#911EB4"),
         ("val_checkpoint_score", "Checkpoint Score", "#42D4F4"),
+        ("val_md_plastic_ckpt_score", "MD+Plastic Ckpt Score", "#BCBD22"),
     ]
     present = [(c, lbl, col) for c, lbl, col in metric_cols if c in df.columns and df[c].notna().any()]
     n_metric = max(1, len(present))

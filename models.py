@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,29 +26,99 @@ def init_multispectral_stem(conv_layer, pretrained_rgb_weight, in_channels=13):
 # SSL4EO-S12 band order (13 bands): B01 B02 B03 B04 B05 B06 B07 B08 B8A B09 B10 B11 B12
 # MARIDA band order (11 bands):     B01 B02 B03 B04 B05 B06 B07 B08 B8A          B11 B12
 _SSL4EO_TO_MARIDA = [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12]  # indices into 13-band SSL4EO
+_SSL4EO_RESNET50_URL = (
+    "https://hf.co/torchgeo/resnet50_sentinel2_all_moco/resolve/"
+    "da4f3c9dbe09272eb902f3b37f46635fa4726879/resnet50_sentinel2_all_moco-df8b932e.pth"
+)
+_SSL4EO_CACHE_NAME = "resnet50_sentinel2_all_moco.pth"
 
 
-def _load_ssl4eo_resnet50(in_channels=14):
+def _ssl4eo_cache_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "pretrained_weights")
+
+
+def _fetch_ssl4eo_state_dict():
     """
-    Load ResNet-50 with SSL4EO-S12 Sentinel-2 MoCo pretrained weights (13-band).
-    Remap conv1 to match MARIDA's 11 bands + 3 index channels (NDVI, FDI, PI).
-
-    Falls back to ImageNet weights if torchgeo is unavailable or download fails.
+    Load SSL4EO-S12 MoCo ResNet-50 weights.
+    1) torchgeo API (fast when GDAL stack works)
+    2) direct HuggingFace download (avoids rasterio/GDAL DLL issues on Windows)
     """
     try:
         from torchgeo.models import ResNet50_Weights as GeoWeights
         from torchgeo.models import resnet50 as geo_resnet50
 
         geo_model = geo_resnet50(weights=GeoWeights.SENTINEL2_ALL_MOCO)
-        s2_state = geo_model.state_dict()
-        s2_conv1 = s2_state["conv1.weight"]  # (64, 13, 7, 7)
-        print(f"[backbone] Loaded SSL4EO-S12 MoCo weights (conv1 shape: {tuple(s2_conv1.shape)})")
+        return geo_model.state_dict(), "torchgeo"
+    except Exception as torchgeo_err:
+        print(f"[backbone] torchgeo path failed ({torchgeo_err}); trying HF cache…")
+        cache_dir = _ssl4eo_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, _SSL4EO_CACHE_NAME)
+        try:
+            if os.path.isfile(cache_path):
+                try:
+                    state = torch.load(cache_path, map_location="cpu", weights_only=True)
+                except TypeError:
+                    state = torch.load(cache_path, map_location="cpu")
+            else:
+                state = torch.hub.load_state_dict_from_url(
+                    _SSL4EO_RESNET50_URL,
+                    model_dir=cache_dir,
+                    file_name=_SSL4EO_CACHE_NAME,
+                    map_location="cpu",
+                )
+            if "conv1.weight" not in state:
+                raise KeyError("downloaded checkpoint missing conv1.weight")
+            return state, "hf_cache"
+        except Exception as hf_err:
+            raise RuntimeError(
+                "SSL4EO-S12 weights could not be loaded. "
+                f"torchgeo error: {torchgeo_err}; HF error: {hf_err}"
+            ) from hf_err
+
+
+def verify_ssl4eo_backbone(in_channels=14, strict=True):
+    """Return (ok, source, conv1_shape). Raises if strict=True and SSL4EO unavailable."""
+    try:
+        state, source = _fetch_ssl4eo_state_dict()
+        shape = tuple(state["conv1.weight"].shape)
+        ok = shape[1] == 13
+        if not ok:
+            msg = f"SSL4EO conv1 has {shape[1]} channels, expected 13"
+            if strict:
+                raise RuntimeError(msg)
+            return False, source, shape
+        return True, source, shape
+    except Exception as exc:
+        if strict:
+            raise
+        return False, "failed", None
+
+
+def _load_ssl4eo_resnet50(in_channels=14, *, strict=True):
+    """
+    Load ResNet-50 with SSL4EO-S12 Sentinel-2 MoCo pretrained weights (13-band).
+    Remap conv1 to match MARIDA's 11 bands + 3 index channels (NDVI, FDI, PI).
+    """
+    try:
+        s2_state, source = _fetch_ssl4eo_state_dict()
+        s2_conv1 = s2_state["conv1.weight"]
+        print(
+            f"[backbone] Loaded SSL4EO-S12 MoCo via {source} "
+            f"(conv1 shape: {tuple(s2_conv1.shape)})"
+        )
     except Exception as e:
+        if strict:
+            raise RuntimeError(
+                "SSL4EO-S12 is required but unavailable. "
+                "Fix torchgeo/GDAL or allow ImageNet with backbone='imagenet'. "
+                f"Details: {e}"
+            ) from e
         print(f"[backbone] SSL4EO-S12 unavailable ({e}), falling back to ImageNet stem init")
         resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
         stem_conv = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
         init_multispectral_stem(stem_conv, resnet.conv1.weight, in_channels)
-        return resnet, stem_conv
+        return resnet, stem_conv, "imagenet_fallback"
 
     resnet = models.resnet50(weights=None)
     rn_state = resnet.state_dict()
@@ -85,7 +157,7 @@ def _load_ssl4eo_resnet50(in_channels=14):
     print(f"[backbone] Sentinel-2 stem: mapped 11/13 bands + {in_channels - 11} index channels "
           f"-> conv1 shape {tuple(stem_conv.weight.shape)}")
 
-    return resnet, stem_conv
+    return resnet, stem_conv, source
 
 
 def _upsample_logits(logits, size):
@@ -690,6 +762,7 @@ class TAUNetResNet50(nn.Module):
         attn_levels=("up4", "up3"),
         use_ssag=True,
         backbone="ssl4eo",
+        ssl4eo_strict=True,
     ):
         super().__init__()
         self.two_head = two_head
@@ -697,14 +770,18 @@ class TAUNetResNet50(nn.Module):
         self.attn_levels = set(attn_levels)
         self.use_ssag = use_ssag
         self.in_channels = in_channels
+        self.backbone_name = backbone
+        self.backbone_source = backbone
 
         # --- Pretrained ResNet-50 encoder ---
         if backbone == "ssl4eo":
-            resnet, stem_conv = _load_ssl4eo_resnet50(in_channels)
+            resnet, stem_conv, source = _load_ssl4eo_resnet50(in_channels, strict=ssl4eo_strict)
+            self.backbone_source = source
         else:
             resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
             stem_conv = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
             init_multispectral_stem(stem_conv, resnet.conv1.weight, in_channels)
+            self.backbone_source = "imagenet"
 
         self.encoder0 = nn.Sequential(stem_conv, resnet.bn1, resnet.relu)  # -> 64, /2
         self.pool0 = resnet.maxpool                                        # -> 64, /4
@@ -840,7 +917,8 @@ class TAUNetResNet50(nn.Module):
 
 
 def build_model(name, in_channels=14, out_classes=4, two_head=True,
-                deep_supervision=True, use_ssag=False, backbone="ssl4eo"):
+                deep_supervision=True, use_ssag=False, backbone="ssl4eo",
+                ssl4eo_strict=True):
     """Factory for all segmentation architectures."""
     name = name.lower()
     if name in ("unet_resnet50", "unetresnet50", "resnet50"):
@@ -872,6 +950,7 @@ def build_model(name, in_channels=14, out_classes=4, two_head=True,
             deep_supervision=deep_supervision,
             use_ssag=use_ssag,
             backbone=backbone,
+            ssl4eo_strict=ssl4eo_strict,
         )
     raise ValueError(
         f"Model necunoscut: {name}. "

@@ -78,6 +78,7 @@ from dataset import (
     get_validation_augmentation,
     load_channel_stats,
     get_inverse_freq_weights,
+    marida_pad_collate,
     NUM_CHANNELS,
 )
 from losses import (
@@ -91,7 +92,13 @@ from metrics_reporting import plot_training_dashboard
 from models import UNetResNet50, TAUNetResNet50, build_model
 from experiment_timing import fmt_duration, format_timing_dict, print_timing_block, sec_since
 from segmentation_utils import compute_md_outlier_metrics, compute_val_metrics
-from training_stability import MetricEMA, ModelEMA, checkpoint_score, set_training_seed
+from training_stability import (
+    MetricEMA,
+    ModelEMA,
+    checkpoint_score,
+    md_plastic_checkpoint_score,
+    set_training_seed,
+)
 
 
 class LinearWarmupCosineScheduler(optim.lr_scheduler._LRScheduler):
@@ -500,10 +507,15 @@ RECIPE_PRESETS = {
         "focal_gamma": 2.0,
         "crop_mining": True,
         "crop_size": 128,
+        "full_patch_prob": 0.5,
         "crop_prob": 0.5,
         "plastic_focus_prob": 0.75,
+        "checkpoint_mode": "md_plastic",
+        "checkpoint_md_iou_weight": 0.5,
+        "checkpoint_plastic_iou_weight": 0.5,
         "variants": ["no_aug"],
         "copy_paste_on_no_aug": True,
+        "ssl4eo_strict": True,
         "seed": 42,
     },
 }
@@ -521,6 +533,8 @@ def print_recipe_config(recipe: str, preset: dict, *, two_head: bool, model_key:
         f"debris_boost={preset.get('debris_boost')} plastic_boost={preset.get('plastic_boost')} "
         f"copy_paste={preset.get('copy_paste_prob')} ema={preset.get('ema_decay', 0)} "
         f"lovasz={preset.get('lovasz_weight')} crop_mining={preset.get('crop_mining', False)} "
+        f"full_patch_prob={preset.get('full_patch_prob', 0)} "
+        f"ckpt_mode={preset.get('checkpoint_mode', 'score_ema')} "
         f"loss_dtype_guard={dtype_guard}"
     )
     print(f"[config] losses module: {losses_path}")
@@ -562,6 +576,7 @@ def run_training(
     resume=True,
     max_steps_per_epoch=None,
     recipe="pretrained_strong",
+    ssl4eo_strict=None,
 ):
     model_key = model_key.lower()
     if recipe not in RECIPE_PRESETS:
@@ -591,7 +606,11 @@ def run_training(
         os.makedirs(run_dir, exist_ok=True)
 
     checkpoint_path = os.path.join(saved_models_dir, f"{model_key}_best.pth")
+    checkpoint_ema_path = os.path.join(saved_models_dir, f"{model_key}_best_score_ema.pth")
     state_path = os.path.join(saved_models_dir, f"{model_key}_state.pth")
+    checkpoint_mode = preset.get("checkpoint_mode", "score_ema")
+    ckpt_md_iou_w = float(preset.get("checkpoint_md_iou_weight", 0.5))
+    ckpt_plastic_iou_w = float(preset.get("checkpoint_plastic_iou_weight", 0.5))
     history_path = (
         os.path.join(run_dir, "istoric_antrenare.csv")
         if run_dir
@@ -621,16 +640,21 @@ def run_training(
         prefer_plastic=True,
         return_paste_stats=True,
     )
-    if preset.get("crop_mining"):
+    use_crop_mining = preset.get("crop_mining", False)
+    train_collate = None
+    if use_crop_mining:
+        full_patch_prob = float(preset.get("full_patch_prob", 0.5))
         train_dataset = MARIDACropMiningDataset(
             train_base,
             crop_size=preset.get("crop_size", 128),
             crop_prob=preset.get("crop_prob", 0.5),
             plastic_focus_prob=preset.get("plastic_focus_prob", 0.75),
+            full_patch_prob=full_patch_prob,
         )
+        train_collate = marida_pad_collate
         print(
-            f"[crop_mining] {preset.get('crop_size', 128)}px crops, "
-            f"prob={preset.get('crop_prob', 0.5)}, "
+            f"[crop_mining] mixed schedule: full_patch={full_patch_prob:.0%}, "
+            f"crop={preset.get('crop_size', 128)}px, crop_prob={preset.get('crop_prob', 0.5)}, "
             f"plastic_focus={preset.get('plastic_focus_prob', 0.75)}"
         )
     else:
@@ -651,6 +675,7 @@ def run_training(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        collate_fn=train_collate,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -665,6 +690,12 @@ def run_training(
     t_step = time.perf_counter()
     use_ssag = preset.get("use_ssag", False)
     backbone = preset.get("backbone", "ssl4eo")
+    if ssl4eo_strict is None:
+        ssl4eo_strict = bool(preset.get("ssl4eo_strict", backbone == "ssl4eo"))
+    if backbone == "ssl4eo":
+        from models import verify_ssl4eo_backbone
+        ok, src, shape = verify_ssl4eo_backbone(NUM_CHANNELS, strict=ssl4eo_strict)
+        print(f"[backbone] SSL4EO preflight: ok={ok} source={src} conv1={shape}")
     model = build_model(
         model_key,
         in_channels=NUM_CHANNELS,
@@ -673,7 +704,10 @@ def run_training(
         deep_supervision=use_deep_sup,
         use_ssag=use_ssag,
         backbone=backbone,
+        ssl4eo_strict=ssl4eo_strict,
     ).to(device)
+    if hasattr(model, "backbone_source"):
+        print(f"[backbone] active encoder weights: {model.backbone_source}")
     timing["setup_model_sec"] = sec_since(t_step)
 
     t_step = time.perf_counter()
@@ -767,6 +801,10 @@ def run_training(
     score_ema = MetricEMA(decay=metric_ema_decay)
 
     best_val_miou = -1.0
+    best_val_md_iou = -1.0
+    best_val_plastic_iou = -1.0
+    best_val_md_plastic_score = -1.0
+    best_val_md_plastic_epoch = 0
     best_checkpoint_score = -1.0
     best_checkpoint_score_ema = -1.0
     epochs_no_improve = 0
@@ -776,6 +814,7 @@ def run_training(
         "train_loss": [], "val_loss": [], "val_miou_fg": [], "val_fg_binary_iou": [],
         "val_md_iou": [], "val_binary_debris_iou": [], "val_plastic_iou": [],
         "val_plastic_recall": [],
+        "val_md_plastic_ckpt_score": [],
         "val_checkpoint_score": [], "val_checkpoint_score_ema": [], "lr": [],
         "epoch_sec": [], "train_sec": [], "val_sec": [], "val_miou_sec": [],
         "epoch_fmt": [], "train_fmt": [], "val_fmt": [],
@@ -797,7 +836,7 @@ def run_training(
                 "epoch_sec", "train_sec", "val_sec", "val_miou_sec",
                 "epoch_fmt", "train_fmt", "val_fmt",
                 "val_fg_binary_iou", "val_md_iou", "val_binary_debris_iou",
-                "val_plastic_iou", "val_plastic_recall",
+                "val_plastic_iou", "val_plastic_recall", "val_md_plastic_ckpt_score",
                 "val_checkpoint_score", "val_checkpoint_score_ema",
             ):
                 istoric.setdefault(key, [])
@@ -805,6 +844,12 @@ def run_training(
             best_checkpoint_score_ema = float(
                 ckpt.get("best_checkpoint_score_ema", best_checkpoint_score_ema)
             )
+            best_val_md_iou = float(ckpt.get("best_val_md_iou", best_val_md_iou))
+            best_val_plastic_iou = float(ckpt.get("best_val_plastic_iou", best_val_plastic_iou))
+            best_val_md_plastic_score = float(
+                ckpt.get("best_val_md_plastic_score", best_val_md_plastic_score)
+            )
+            best_val_md_plastic_epoch = int(ckpt.get("best_val_md_plastic_epoch", best_val_md_plastic_epoch))
             paste_stats_all = ckpt.get("paste_stats_all", paste_stats_all)
             print(f"Resumed from {state_path} at epoch {start_epoch + 1}")
         except Exception as exc:
@@ -824,8 +869,13 @@ def run_training(
                     "scheduler": scheduler.state_dict(),
                     "epoch": epoch_done,
                     "best_val_miou": best_val_miou,
+                    "best_val_md_iou": best_val_md_iou,
+                    "best_val_plastic_iou": best_val_plastic_iou,
+                    "best_val_md_plastic_score": best_val_md_plastic_score,
+                    "best_val_md_plastic_epoch": best_val_md_plastic_epoch,
                     "best_checkpoint_score": best_checkpoint_score,
                     "best_checkpoint_score_ema": best_checkpoint_score_ema,
+                    "checkpoint_mode": checkpoint_mode,
                     "epochs_no_improve": epochs_no_improve,
                     "istoric": istoric,
                     "paste_stats_all": paste_stats_all,
@@ -923,6 +973,11 @@ def run_training(
                     fg_binary_weight=ckpt_fg_w,
                 )
             val_ckpt_score_ema = score_ema.update(val_ckpt_score)
+            val_md_plastic_ckpt = md_plastic_checkpoint_score(
+                val_metrics,
+                md_weight=ckpt_md_iou_w,
+                plastic_weight=ckpt_plastic_iou_w,
+            )
             val_miou_sec = sec_since(t_miou)
             val_sec = round(val_part_sec + val_miou_sec, 2)
             epoch_sec = sec_since(t_epoch)
@@ -943,7 +998,8 @@ def run_training(
             f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
             f"Val mIoU (fg): {val_miou_fg:.4f} | Plastic IoU: {val_plastic_iou:.4f} "
             f"(R={val_plastic_recall:.3f}) | Fg-bin IoU: {val_fg_binary:.4f}{md_line} | "
-            f"Score: {val_ckpt_score:.4f} (EMA {val_ckpt_score_ema:.4f}) | LR: {lr_curent:.6f}{ema_info} | "
+            f"Score: {val_ckpt_score:.4f} (EMA {val_ckpt_score_ema:.4f}) | "
+            f"MD+Pl: {val_md_plastic_ckpt:.4f} | LR: {lr_curent:.6f}{ema_info} | "
             f"Time: train {fmt_duration(train_sec)} val {fmt_duration(val_sec)} "
             f"(ep {fmt_duration(epoch_sec)})"
         )
@@ -954,19 +1010,38 @@ def run_training(
         if val_ckpt_score_ema > best_checkpoint_score_ema:
             best_checkpoint_score_ema = val_ckpt_score_ema
             best_checkpoint_score = val_ckpt_score
-            epochs_no_improve = 0
-            torch.save(model.state_dict(), checkpoint_path)
+            torch.save(model.state_dict(), checkpoint_ema_path)
             if model_ema is not None:
                 ema_path = checkpoint_path.replace("_best.pth", "_ema_best.pth")
                 torch.save(model_ema.state_dict(model), ema_path)
-            save_msg = (
-                f"*** Salvat (score EMA={best_checkpoint_score_ema:.4f}, "
-                f"mIoU={val_miou_fg:.4f}, plastic={val_plastic_iou:.4f}, "
-                f"fg-bin={val_fg_binary:.4f}"
-            )
-            if training_mode == "md_outlier":
-                save_msg += f", MD={val_md_iou:.4f}, plastic_R={val_plastic_recall:.3f}"
-            print(f"{save_msg}) -> {checkpoint_path} ***")
+
+        use_md_plastic_ckpt = checkpoint_mode == "md_plastic"
+        ckpt_improved = (
+            val_md_plastic_ckpt > best_val_md_plastic_score
+            if use_md_plastic_ckpt
+            else val_ckpt_score_ema > best_checkpoint_score_ema
+        )
+        if ckpt_improved:
+            if use_md_plastic_ckpt:
+                best_val_md_plastic_score = val_md_plastic_ckpt
+                best_val_md_iou = val_md_iou
+                best_val_plastic_iou = val_plastic_iou
+                best_val_md_plastic_epoch = epoch + 1
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), checkpoint_path)
+            if use_md_plastic_ckpt:
+                save_msg = (
+                    f"*** Salvat MD+plastic (score={best_val_md_plastic_score:.4f}, "
+                    f"MD={val_md_iou:.4f}, plastic={val_plastic_iou:.4f}, ep={epoch + 1}) "
+                    f"-> {checkpoint_path} ***"
+                )
+            else:
+                save_msg = (
+                    f"*** Salvat (score EMA={best_checkpoint_score_ema:.4f}, "
+                    f"mIoU={val_miou_fg:.4f}, plastic={val_plastic_iou:.4f}, "
+                    f"fg-bin={val_fg_binary:.4f}) -> {checkpoint_path} ***"
+                )
+            print(save_msg)
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
@@ -981,6 +1056,7 @@ def run_training(
         istoric["val_binary_debris_iou"].append(val_binary_debris)
         istoric["val_plastic_iou"].append(val_plastic_iou)
         istoric["val_plastic_recall"].append(val_plastic_recall)
+        istoric["val_md_plastic_ckpt_score"].append(val_md_plastic_ckpt)
         istoric["val_checkpoint_score"].append(val_ckpt_score)
         istoric["val_checkpoint_score_ema"].append(val_ckpt_score_ema)
         istoric["lr"].append(lr_curent)
@@ -1040,6 +1116,12 @@ def run_training(
         "checkpoint_path": checkpoint_path,
         "history_path": history_path,
         "best_val_miou_fg": best_val_miou,
+        "best_val_md_iou": best_val_md_iou,
+        "best_val_plastic_iou": best_val_plastic_iou,
+        "best_val_md_plastic_score": best_val_md_plastic_score,
+        "best_val_md_plastic_epoch": best_val_md_plastic_epoch,
+        "checkpoint_mode": checkpoint_mode,
+        "checkpoint_ema_path": checkpoint_ema_path,
         "best_checkpoint_score": best_checkpoint_score,
         "best_checkpoint_score_ema": best_checkpoint_score_ema,
         "epochs_ran": epochs_ran,
@@ -1048,6 +1130,8 @@ def run_training(
         "use_amp": use_amp,
         "recipe": recipe,
         "training_mode": training_mode,
+        "backbone": preset.get("backbone", "ssl4eo"),
+        "backbone_source": getattr(model, "backbone_source", None),
         "class_weights": weight_list,
         "use_focal": preset["use_focal"],
         "lovasz_weight": preset["lovasz_weight"],

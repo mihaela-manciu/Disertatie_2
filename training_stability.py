@@ -94,6 +94,21 @@ def checkpoint_score(
     return (miou_weight * miou + plastic_weight * plastic + fg_binary_weight * fg_bin) / total_w
 
 
+def md_plastic_checkpoint_score(
+    metrics: dict,
+    *,
+    md_weight: float = 0.5,
+    plastic_weight: float = 0.5,
+) -> float:
+    """Raw val score for thesis checkpoints: MARIDA MD IoU + plastic IoU."""
+    md = float(metrics.get("marida_md_IoU", metrics.get("binary_debris_IoU", 0.0)))
+    plastic = float(metrics.get("plastic_IoU", metrics.get("per_class", {}).get(1, {}).get("IoU", 0.0)))
+    total_w = md_weight + plastic_weight
+    if total_w <= 0:
+        return md
+    return (md_weight * md + plastic_weight * plastic) / total_w
+
+
 class MetricEMA:
     """Smooth validation metrics across epochs for checkpoint / early stopping."""
 

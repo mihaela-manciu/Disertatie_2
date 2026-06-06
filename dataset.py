@@ -453,18 +453,63 @@ class MARIDADataset(Dataset):
         return img_tensor, mask_tensor
 
 
+def marida_pad_collate(batch):
+    """Pad mixed 128/256 training samples to a common size for batching."""
+    has_meta = len(batch[0]) == 3
+    images = [item[0] for item in batch]
+    masks = [item[1] for item in batch]
+    metas = [item[2] for item in batch] if has_meta else None
+
+    max_h = max(img.shape[1] for img in images)
+    max_w = max(img.shape[2] for img in images)
+    channels = images[0].shape[0]
+    batch_imgs = []
+    batch_masks = []
+    for img, mask in zip(images, masks):
+        h, w = img.shape[1], img.shape[2]
+        if h == max_h and w == max_w:
+            batch_imgs.append(img)
+            batch_masks.append(mask)
+            continue
+        padded = torch.zeros((channels, max_h, max_w), dtype=img.dtype)
+        padded[:, :h, :w] = img
+        batch_imgs.append(padded)
+        padded_m = torch.zeros((max_h, max_w), dtype=mask.dtype)
+        padded_m[:h, :w] = mask
+        batch_masks.append(padded_m)
+
+    out_imgs = torch.stack(batch_imgs, dim=0)
+    out_masks = torch.stack(batch_masks, dim=0)
+    if not has_meta:
+        return out_imgs, out_masks
+
+    if isinstance(metas[0], dict) and "pasted_pixels" in metas[0]:
+        pasted = torch.tensor([int(m.get("pasted_pixels", 0)) for m in metas], dtype=torch.long)
+        total = torch.tensor([int(m.get("total_pixels", 0)) for m in metas], dtype=torch.long)
+        return out_imgs, out_masks, {"pasted_pixels": pasted, "total_pixels": total}
+    return out_imgs, out_masks, metas
+
+
 class MARIDACropMiningDataset(Dataset):
     """
-    Wraps MARIDADataset and extracts fixed-size crops centered on plastic/debris pixels.
-    Outlier-first training: half the batches see zoomed-in MD regions.
+    Wraps MARIDADataset with a mixed 128/256 schedule:
+    - full_patch_prob: native patch (e.g. 256×256) for test distribution match
+    - otherwise: fixed crop_size windows (debris-centered or random)
     """
 
-    def __init__(self, base: MARIDADataset, crop_size: int = 128, crop_prob: float = 0.5,
-                 plastic_focus_prob: float = 0.75):
+    def __init__(
+        self,
+        base: MARIDADataset,
+        crop_size: int = 128,
+        crop_prob: float = 0.5,
+        plastic_focus_prob: float = 0.75,
+        full_patch_prob: float = 0.5,
+    ):
         self.base = base
         self.crop_size = int(crop_size)
         self.crop_prob = float(crop_prob)
         self.plastic_focus_prob = float(plastic_focus_prob)
+        self.full_patch_prob = float(full_patch_prob)
 
     def __len__(self):
         return len(self.base)
@@ -487,6 +532,7 @@ class MARIDACropMiningDataset(Dataset):
             "crop_size": self.crop_size,
             "crop_prob": self.crop_prob,
             "plastic_focus_prob": self.plastic_focus_prob,
+            "full_patch_prob": self.full_patch_prob,
         }
 
     def __setstate__(self, state):
@@ -545,7 +591,7 @@ class MARIDACropMiningDataset(Dataset):
         else:
             img, mask = item
             meta = None
-        if self.base.split == "train":
+        if self.base.split == "train" and random.random() >= self.full_patch_prob:
             img_np = self._to_hwc(img)
             mask_np = mask.numpy() if isinstance(mask, torch.Tensor) else np.asarray(mask)
             if random.random() < self.crop_prob:
@@ -554,6 +600,9 @@ class MARIDACropMiningDataset(Dataset):
                 img_np, mask_np = self._random_window(img_np, mask_np)
             img = torch.from_numpy(img_np.transpose(2, 0, 1).astype(np.float32))
             mask = torch.from_numpy(mask_np.astype(np.int64)).clamp(0, 3)
+        elif self.base.split == "train":
+            if isinstance(mask, torch.Tensor):
+                mask = mask.clamp(0, 3)
         if meta is not None:
             return img, mask, meta
         return img, mask

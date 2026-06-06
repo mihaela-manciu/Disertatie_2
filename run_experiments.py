@@ -61,14 +61,23 @@ EXPERIMENT_SPECS = {
 DEFAULT_MODEL_ORDER = ["taunet_resnet50", "taunet", "resunext"]
 
 
-def _paths(model_key: str, root: str) -> dict:
+def _paths(model_key: str, root: str, variant: str = "no_aug") -> dict:
     return {
         "model_key": model_key,
-        "run_dir": os.path.join(root, "results", model_key),
-        "checkpoint": os.path.join(root, "saved_models", f"{model_key}_best.pth"),
-        "eval_config": os.path.join(root, "results", model_key, "eval_config.json"),
-        "train_meta": os.path.join(root, "results", model_key, "train_summary.json"),
+        "variant": variant,
+        "run_dir": os.path.join(root, "results", model_key, variant),
+        "checkpoint": os.path.join(root, "saved_models", variant, f"{model_key}_best.pth"),
+        "eval_config": os.path.join(root, "results", model_key, variant, "eval_config.json"),
+        "train_meta": os.path.join(root, "results", model_key, variant, "train_summary.json"),
     }
+
+
+def _safe_record_step(record_fn, step_name, duration_sec, **extra):
+    """Log pipeline timing without failing train/eval if logging kwargs clash."""
+    try:
+        record_fn(step_name, duration_sec, **extra)
+    except Exception as exc:
+        print(f"[warning] timing log failed for {step_name}: {exc}")
 
 
 def _banner(title: str) -> None:
@@ -116,6 +125,7 @@ def train_experiment_variant(
     cooldown_between_epochs: float = 0.0, resume: bool = True,
     max_steps_per_epoch=None, recipe: str = "pretrained_strong",
     two_head_override: bool | None = None,
+    ssl4eo_strict: bool | None = None,
 ) -> dict:
     spec = EXPERIMENT_SPECS[model_key]
     run_dir = os.path.join(root, "results", model_key, variant)
@@ -157,6 +167,7 @@ def train_experiment_variant(
                 cooldown_between_epochs=cooldown_between_epochs,
                 resume=resume, max_steps_per_epoch=max_steps_per_epoch,
                 recipe=recipe,
+                ssl4eo_strict=ssl4eo_strict,
             )
             train_result["effective_batch_size"] = step["batch_size"]
             break
@@ -225,6 +236,7 @@ def evaluate_variant(marida_path, model_key, root, *, variant, tune_on_val,
     result["wall_duration_sec"] = round(time.time() - t0, 1)
     if "duration_sec" not in result:
         result["duration_sec"] = result["wall_duration_sec"]
+    result["variant"] = variant
     return result
 
 
@@ -283,19 +295,40 @@ def build_visual_comparisons(marida_path, model_key, root, *, max_samples=8):
 
     duration = sec_since(t0)
     print(f"[timing] visual comparisons {model_key}: {fmt_duration(duration)}")
-    return {"duration_sec": duration, "samples": min(max_samples, len(ds))}
+    return {"wall_duration_sec": duration, "samples": min(max_samples, len(ds))}
+
+
+def _load_train_summary(root: str, model_key: str, variant: str) -> dict | None:
+    path = _paths(model_key, root, variant)["train_meta"]
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def build_comparison_row(model_key, root, train_info, eval_info):
     spec = EXPERIMENT_SPECS[model_key]
-    paths = _paths(model_key, root)
-    per_class = eval_info["metrics_per_class"]
+    per_class_raw = eval_info["metrics_per_class"]
+    per_class = {int(k): v for k, v in per_class_raw.items()}
     debris = eval_info["debris_metrics"]
+
+    variant = (
+        (train_info or {}).get("variant")
+        or eval_info.get("variant")
+        or os.path.basename(eval_info.get("results_dir", ""))
+        or "no_aug"
+    )
+    if (not train_info or "error" in train_info) and variant:
+        train_info = _load_train_summary(root, model_key, variant) or train_info
+    paths = _paths(model_key, root, variant)
 
     if train_info and "two_head" in train_info:
         two_head_used = bool(train_info["two_head"])
     else:
-        ckpt = train_info.get("checkpoint_path") if train_info else paths["checkpoint"]
+        ckpt = (train_info or {}).get("checkpoint_path") or paths["checkpoint"]
         two_head_used = False
         if ckpt and os.path.isfile(ckpt):
             import torch
@@ -304,8 +337,6 @@ def build_comparison_row(model_key, root, train_info, eval_info):
             except TypeError:
                 state = torch.load(ckpt, map_location="cpu")
             two_head_used = _detect_two_head(state)
-
-    variant = (train_info or {}).get("variant") or eval_info.get("variant", "")
     label = f"{spec['display_name']} ({variant})" if variant else spec["display_name"]
     row = {
         "model_key": model_key,
@@ -430,6 +461,11 @@ def parse_args():
     p.add_argument("--no-resume", action="store_true")
     p.add_argument("--full-tune", action="store_true")
     p.add_argument("--smoke", action="store_true")
+    p.add_argument(
+        "--allow-imagenet-backbone",
+        action="store_true",
+        help="Allow ImageNet fallback if SSL4EO-S12 cannot load (default: abort)",
+    )
     return p.parse_args()
 
 
@@ -542,6 +578,7 @@ def main():
         pin_memory=args.pin_memory, cooldown_between_epochs=args.cooldown,
         resume=do_resume, max_steps_per_epoch=max_steps_per_epoch,
         recipe=args.recipe, two_head_override=two_head_override,
+        ssl4eo_strict=False if args.allow_imagenet_backbone else None,
     )
 
     user_stopped = False
@@ -557,12 +594,13 @@ def main():
                         result = train_experiment_variant(
                             marida, model_key, root, variant=variant, **_train_kwargs)
                         train_results[variant][model_key] = result
-                        _record_step(
+                        _safe_record_step(
+                            _record_step,
                             f"train/{model_key}/{variant}",
                             sec_since(t_step),
                             model=model_key,
                             variant=variant,
-                            duration_sec=result.get("duration_sec"),
+                            wall_duration_sec=result.get("duration_sec"),
                         )
                         pipeline_timing.setdefault("by_model", {}).setdefault(model_key, {})[variant] = {
                             "train_sec": result.get("duration_sec"),
@@ -579,7 +617,8 @@ def main():
                                 plot_training_dashboard(
                                     hist_csv, curve_dir, f"{spec['display_name']} ({variant})",
                                 )
-                                _record_step(
+                                _safe_record_step(
+                                    _record_step,
                                     f"plot_curves/{model_key}/{variant}",
                                     sec_since(t_plot),
                                     model=model_key,
@@ -624,12 +663,13 @@ def main():
                             eval_workers=args.eval_workers, fast_tune=fast_tune,
                         )
                         ev = eval_results[variant][model_key]
-                        _record_step(
+                        _safe_record_step(
+                            _record_step,
                             f"eval/{model_key}/{variant}",
                             sec_since(t_step),
                             model=model_key,
                             variant=variant,
-                            duration_sec=ev.get("duration_sec"),
+                            wall_duration_sec=ev.get("duration_sec"),
                         )
                         pipeline_timing.setdefault("by_model", {}).setdefault(model_key, {}).setdefault(variant, {})
                         pipeline_timing["by_model"][model_key][variant]["eval_sec"] = ev.get("duration_sec")
@@ -648,11 +688,13 @@ def main():
                     if os.path.isfile(no_ckpt) and os.path.isfile(aug_ckpt):
                         t_step = time.perf_counter()
                         vis_timing = build_visual_comparisons(marida, model_key, root, max_samples=8)
-                        _record_step(
+                        _safe_record_step(
+                            _record_step,
                             f"visual_compare/{model_key}",
                             sec_since(t_step),
                             model=model_key,
-                            **(vis_timing or {}),
+                            samples=(vis_timing or {}).get("samples"),
+                            wall_duration_sec=(vis_timing or {}).get("wall_duration_sec"),
                         )
                 except Exception as exc:
                     print(f"EROARE comparații vizuale {model_key}: {exc}")
