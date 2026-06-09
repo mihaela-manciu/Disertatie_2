@@ -97,16 +97,44 @@ def checkpoint_score(
 def md_plastic_checkpoint_score(
     metrics: dict,
     *,
-    md_weight: float = 0.5,
-    plastic_weight: float = 0.5,
+    md_weight: float = 0.4,
+    plastic_weight: float = 0.4,
+    plastic_precision_weight: float = 0.2,
 ) -> float:
-    """Raw val score for thesis checkpoints: MARIDA MD IoU + plastic IoU."""
+    """Val score for thesis checkpoints: MD IoU + plastic IoU + plastic precision."""
     md = float(metrics.get("marida_md_IoU", metrics.get("binary_debris_IoU", 0.0)))
     plastic = float(metrics.get("plastic_IoU", metrics.get("per_class", {}).get(1, {}).get("IoU", 0.0)))
-    total_w = md_weight + plastic_weight
+    precision = float(
+        metrics.get("plastic_precision", metrics.get("per_class", {}).get(1, {}).get("Precision", 0.0))
+    )
+    total_w = md_weight + plastic_weight + plastic_precision_weight
     if total_w <= 0:
         return md
-    return (md_weight * md + plastic_weight * plastic) / total_w
+    return (
+        md_weight * md + plastic_weight * plastic + plastic_precision_weight * precision
+    ) / total_w
+
+
+def model_weights_finite(model: torch.nn.Module) -> bool:
+    for param in model.parameters():
+        if not torch.isfinite(param).all():
+            return False
+    return True
+
+
+def is_validation_collapsed(
+    metrics: dict,
+    *,
+    best_md_plastic_score: float,
+    min_best_score: float = 0.03,
+) -> bool:
+    """True when val metrics flatline after a meaningful checkpoint was already saved."""
+    if best_md_plastic_score < min_best_score:
+        return False
+    md = float(metrics.get("marida_md_IoU", metrics.get("binary_debris_IoU", 0.0)))
+    plastic = float(metrics.get("plastic_IoU", 0.0))
+    recall = float(metrics.get("plastic_recall", 0.0))
+    return md < 0.005 and plastic < 0.005 and recall < 0.01
 
 
 class MetricEMA:

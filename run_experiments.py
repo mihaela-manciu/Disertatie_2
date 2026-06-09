@@ -126,6 +126,7 @@ def train_experiment_variant(
     max_steps_per_epoch=None, recipe: str = "pretrained_strong",
     two_head_override: bool | None = None,
     ssl4eo_strict: bool | None = None,
+    init_checkpoint: str | None = None,
 ) -> dict:
     spec = EXPERIMENT_SPECS[model_key]
     run_dir = os.path.join(root, "results", model_key, variant)
@@ -168,6 +169,7 @@ def train_experiment_variant(
                 resume=resume, max_steps_per_epoch=max_steps_per_epoch,
                 recipe=recipe,
                 ssl4eo_strict=ssl4eo_strict,
+                init_checkpoint=init_checkpoint,
             )
             train_result["effective_batch_size"] = step["batch_size"]
             break
@@ -205,7 +207,7 @@ def train_experiment_variant(
 
 
 def evaluate_variant(marida_path, model_key, root, *, variant, tune_on_val,
-                     force_retune, eval_workers, fast_tune=True):
+                     force_retune, eval_workers, fast_tune=True, recipe="md_outlier"):
     t0 = time.time()
     spec = EXPERIMENT_SPECS[model_key]
     ckpt = os.path.join(root, "saved_models", variant, f"{model_key}_best.pth")
@@ -226,12 +228,35 @@ def evaluate_variant(marida_path, model_key, root, *, variant, tune_on_val,
     print(f"[{model_key}/{variant}] eval two_head="
           f"{two_head_hint if two_head_hint is not None else 'auto-detect from checkpoint'}")
 
+    from train import RECIPE_PRESETS
+    preset = RECIPE_PRESETS.get(recipe, {})
+    tune_mode = preset.get("eval_tune_mode", "miou")
+    default_eval = None
+    if tune_mode == "md_plastic":
+        default_eval = {
+            "decode_mode": "two_head",
+            "debris_threshold": preset.get("eval_debris_threshold", 0.40),
+            "type_confidence_threshold": 0.0,
+            "require_seg_fg": False,
+            "tta_scales": list(preset.get("tta_scales_eval", [1.0])),
+            "use_crf": preset.get("eval_use_crf", False),
+            "min_component_size": preset.get("eval_min_component_size", 0),
+        }
+
     result = evaluate_pipeline(
         marida_path, ckpt, model_key=model_key,
         model_name=f"{spec['display_name']} ({variant})",
         results_dir=results_dir, eval_config_path=eval_cfg,
         tune_on_val=tune_on_val, two_head=two_head_hint,
         num_workers=eval_workers, fast_tune=fast_tune,
+        tune_mode=tune_mode, default_eval_config=default_eval,
+        tune_md_weight=float(preset.get("checkpoint_md_iou_weight", 0.5)),
+        tune_plastic_weight=float(preset.get("checkpoint_plastic_iou_weight", 0.5)),
+        tune_plastic_precision_weight=float(
+            preset.get("checkpoint_plastic_precision_weight", 0.0)
+        ),
+        tune_prefer_threshold=preset.get("eval_prefer_threshold"),
+        tune_threshold_score_tol=float(preset.get("eval_threshold_score_tol", 0.01)),
     )
     result["wall_duration_sec"] = round(time.time() - t0, 1)
     if "duration_sec" not in result:
@@ -466,6 +491,12 @@ def parse_args():
         action="store_true",
         help="Allow ImageNet fallback if SSL4EO-S12 cannot load (default: abort)",
     )
+    p.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help="Load model weights before training (overrides recipe init_weights_path)",
+    )
     return p.parse_args()
 
 
@@ -579,6 +610,7 @@ def main():
         resume=do_resume, max_steps_per_epoch=max_steps_per_epoch,
         recipe=args.recipe, two_head_override=two_head_override,
         ssl4eo_strict=False if args.allow_imagenet_backbone else None,
+        init_checkpoint=args.init_checkpoint,
     )
 
     user_stopped = False
@@ -650,17 +682,24 @@ def main():
                         continue
                     try:
                         t_step = time.perf_counter()
-                        fast_tune = not args.full_tune
+                        from train import RECIPE_PRESETS as _RECIPE_PRESETS
+                        _preset = _RECIPE_PRESETS.get(args.recipe, {})
+                        if args.full_tune:
+                            fast_tune = False
+                        elif "eval_fast_tune" in _preset:
+                            fast_tune = bool(_preset["eval_fast_tune"])
+                        else:
+                            fast_tune = not args.full_tune
                         if args.recipe in (
                             "strong", "strong_two_head",
                             "pretrained_strong", "pretrained_strong_two_head",
-                            "md_outlier",
-                        ):
+                        ) and not args.full_tune and "eval_fast_tune" not in _preset:
                             fast_tune = False
                         eval_results[variant][model_key] = evaluate_variant(
                             marida, model_key, root, variant=variant,
                             tune_on_val=tune_on_val, force_retune=args.retune,
                             eval_workers=args.eval_workers, fast_tune=fast_tune,
+                            recipe=args.recipe,
                         )
                         ev = eval_results[variant][model_key]
                         _safe_record_step(

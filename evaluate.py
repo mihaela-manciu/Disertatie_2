@@ -22,8 +22,11 @@ from segmentation_utils import (
     _eval_batch,
     calculate_debris_metrics,
     calculate_metrics,
+    eval_config_from_tune_row,
     load_eval_config,
     save_eval_config,
+    training_baseline_eval_config,
+    tune_thresholds_md_plastic,
     tune_thresholds_on_val,
     update_confusion_matrix,
 )
@@ -272,6 +275,10 @@ def evaluate_pipeline(
     cale_dataset, model_path, model_key="taunet_resnet50", model_name=None,
     results_dir="results", eval_config_path=None, tune_on_val=True,
     two_head=None, model_class=None, num_workers=0, fast_tune=True,
+    tune_mode="miou", default_eval_config=None,
+    tune_md_weight=0.5, tune_plastic_weight=0.5,
+    tune_plastic_precision_weight=0.0,
+    tune_prefer_threshold=None, tune_threshold_score_tol=0.01,
 ):
     model_key = model_key.lower()
     if two_head is None:
@@ -320,23 +327,43 @@ def evaluate_pipeline(
     eval_config = load_eval_config(eval_config_path)
     t_step = time.perf_counter()
     if eval_config is None and tune_on_val:
-        print(f"Calibrare hiperparametri pe setul de validare (fast={fast_tune})...")
-        eval_config = tune_thresholds_on_val(
-            model, val_loader, device,
-            use_two_head=getattr(model, "two_head", False),
-            fast=fast_tune,
+        print(
+            f"Calibrare hiperparametri pe setul de validare "
+            f"(mode={tune_mode}, fast={fast_tune})..."
         )
+        if tune_mode == "md_plastic" and two_head:
+            best_row, _ = tune_thresholds_md_plastic(
+                model, val_loader, device,
+                use_two_head=True,
+                fast=fast_tune,
+                md_weight=tune_md_weight,
+                plastic_weight=tune_plastic_weight,
+                plastic_precision_weight=tune_plastic_precision_weight,
+                preferred_threshold=tune_prefer_threshold,
+                preferred_threshold_tol=tune_threshold_score_tol,
+            )
+            eval_config = eval_config_from_tune_row(best_row)
+            print(
+                f"[tune] best val MD IoU={best_row.get('val_md_iou', 0):.3f} "
+                f"plastic IoU={best_row.get('val_plastic_iou', 0):.3f} "
+                f"thr={eval_config.get('debris_threshold')}"
+            )
+        else:
+            eval_config = tune_thresholds_on_val(
+                model, val_loader, device,
+                use_two_head=getattr(model, "two_head", False),
+                fast=fast_tune,
+            )
         save_eval_config(eval_config, eval_config_path)
         print(f"Config salvat: {json.dumps(eval_config, indent=2)}")
         timing["tune_on_val_sec"] = sec_since(t_step)
     elif eval_config is None:
-        eval_config = {
-            "decode_mode": "two_head" if two_head else "softmax",
-            "debris_threshold": 0.5,
-            "min_component_size": 8,
-            "tta_scales": [1.0],
-            "use_crf": False,
-        }
+        if default_eval_config is not None:
+            eval_config = dict(default_eval_config)
+        elif two_head:
+            eval_config = training_baseline_eval_config(two_head=True)
+        else:
+            eval_config = training_baseline_eval_config(two_head=False)
         timing["tune_on_val_sec"] = 0.0
     else:
         timing["tune_on_val_sec"] = 0.0

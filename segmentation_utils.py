@@ -167,13 +167,32 @@ def decode_thresholds(probs, thresholds):
     return preds
 
 
-def decode_two_head(seg_probs, debris_probs, type_probs, debris_threshold=0.5):
-    """Fuse seg + debris/type heads. Debris gate overrides class on flagged pixels."""
+def decode_two_head(
+    seg_probs,
+    debris_probs,
+    type_probs,
+    debris_threshold=0.5,
+    type_confidence_threshold=0.0,
+    require_seg_fg=False,
+):
+    """
+    Fuse seg + debris/type heads.
+    Gate: debris prob AND (optional) seg foreground AND (optional) type confidence.
+    Prevents debris-only spray-painting of water (history18 ep26: R=0.88, IoU=0.003).
+    """
     seg_pred = torch.argmax(seg_probs, dim=1)
-    debris_mask = debris_probs.squeeze(1) >= debris_threshold
-    type_pred = torch.argmax(type_probs, dim=1) + 1
+    debris_p = debris_probs.squeeze(1) if debris_probs.ndim == 4 else debris_probs
+    debris_mask = debris_p >= debris_threshold
+    type_conf, type_cls = torch.max(type_probs, dim=1)
+
+    gate = debris_mask
+    if require_seg_fg:
+        gate = gate & (seg_pred > 0)
+    if type_confidence_threshold > 0:
+        gate = gate & (type_conf >= type_confidence_threshold)
+
     refined = seg_pred.clone()
-    refined[debris_mask] = type_pred[debris_mask]
+    refined[gate] = type_cls[gate] + 1
     return refined.cpu().numpy()
 
 
@@ -268,14 +287,21 @@ def calculate_md_binary_iou(target, pred_binary):
     return float(tp / (tp + fp + fn + 1e-8))
 
 
-def _decode_batch(model, images, device, two_head=False, debris_threshold=0.5,
-                  fg_threshold=None):
+def _decode_batch(
+    model, images, device, two_head=False, debris_threshold=0.5,
+    fg_threshold=None, type_confidence_threshold=0.0, require_seg_fg=True,
+):
     out = model_forward(model, images)
+
     if two_head:
         seg_p = torch.softmax(out["seg"], dim=1)
         debris_p = torch.sigmoid(out["debris"])
         type_p = torch.softmax(out["type"], dim=1)
-        pred = decode_two_head(seg_p, debris_p, type_p, debris_threshold)
+        pred = decode_two_head(
+            seg_p, debris_p, type_p, debris_threshold,
+            type_confidence_threshold=type_confidence_threshold,
+            require_seg_fg=require_seg_fg,
+        )
     else:
         seg_p = torch.softmax(out["seg"], dim=1)
         if fg_threshold is not None and fg_threshold > 0:
@@ -287,11 +313,37 @@ def _decode_batch(model, images, device, two_head=False, debris_threshold=0.5,
     return pred
 
 
-def compute_val_metrics(model, dataloader, device, two_head=False,
-                        debris_threshold=0.5, fg_threshold=None,
-                        use_tta=False, postprocess=False, verbose=True):
+def _pred_from_outputs(
+    out, two_head, debris_threshold, fg_threshold,
+    type_confidence_threshold, require_seg_fg,
+):
+    seg_p = torch.softmax(out["seg"], dim=1)
+    if two_head:
+        debris_p = torch.sigmoid(out["debris"].float())
+        type_p = torch.softmax(out["type"], dim=1)
+        pred = decode_two_head(
+            seg_p, debris_p, type_p, debris_threshold,
+            type_confidence_threshold=type_confidence_threshold,
+            require_seg_fg=require_seg_fg,
+        )
+    elif fg_threshold is not None and fg_threshold > 0:
+        pred = decode_seg_confidence(seg_p, fg_threshold=fg_threshold)
+    else:
+        pred = decode_softmax(seg_p)
+    if pred.ndim == 2:
+        pred = pred[None, ...]
+    return pred
+
+
+def compute_val_metrics(
+    model, dataloader, device, two_head=False,
+    debris_threshold=0.5, fg_threshold=None,
+    type_confidence_threshold=0.0, require_seg_fg=True,
+    use_tta=False, postprocess=False, verbose=True,
+):
     model.eval()
     conf_matrix = np.zeros((4, 4), dtype=np.int64)
+    bin_tp = bin_fp = bin_fn = 0
     with torch.no_grad():
         for images, masks in dataloader:
             images = images.to(device)
@@ -301,15 +353,32 @@ def compute_val_metrics(model, dataloader, device, two_head=False,
             if use_tta:
                 if two_head:
                     seg_p, debris_p, type_p = predict_with_tta_two_head(model, images, device)
-                    pred = decode_two_head(seg_p, debris_p, type_p, debris_threshold)
+                    pred = decode_two_head(
+                        seg_p, debris_p, type_p, debris_threshold,
+                        type_confidence_threshold=type_confidence_threshold,
+                        require_seg_fg=require_seg_fg,
+                    )
                 else:
                     seg_p = predict_with_tta_softmax(model, images, device)
                     pred = decode_softmax(seg_p)
                 if pred.ndim == 2:
                     pred = pred[None, ...]
             else:
-                pred = _decode_batch(
-                    model, images, device, two_head, debris_threshold, fg_threshold,
+                out = model_forward(model, images)
+                if two_head:
+                    debris_p = torch.sigmoid(out["debris"].float())
+                    if debris_p.ndim == 4:
+                        debris_p = debris_p.squeeze(1)
+                    pred_bin = (debris_p >= debris_threshold).cpu().numpy()
+                    for sample_idx in range(mask_np.shape[0]):
+                        gt_md = (mask_np[sample_idx] == 1) | (mask_np[sample_idx] == 2)
+                        p_bin = pred_bin[sample_idx]
+                        bin_tp += int(np.logical_and(p_bin, gt_md).sum())
+                        bin_fp += int(np.logical_and(p_bin, ~gt_md).sum())
+                        bin_fn += int(np.logical_and(~p_bin, gt_md).sum())
+                pred = _pred_from_outputs(
+                    out, two_head, debris_threshold, fg_threshold,
+                    type_confidence_threshold, require_seg_fg,
                 )
             for sample_idx in range(pred.shape[0]):
                 p = pred[sample_idx]
@@ -319,9 +388,18 @@ def compute_val_metrics(model, dataloader, device, two_head=False,
     per_class = calculate_metrics(conf_matrix)
     debris_metrics = calculate_debris_metrics(conf_matrix)
     debris_metrics["per_class"] = per_class
+    if two_head and (bin_tp + bin_fp + bin_fn) > 0:
+        debris_metrics["binary_head_md_recall"] = float(bin_tp / (bin_tp + bin_fn + 1e-8))
+        debris_metrics["binary_head_md_precision"] = float(bin_tp / (bin_tp + bin_fp + 1e-8))
+    else:
+        debris_metrics["binary_head_md_recall"] = 0.0
+        debris_metrics["binary_head_md_precision"] = 0.0
     if verbose:
         if two_head:
-            label = "two-head"
+            label = (
+                f"two-head thr={debris_threshold:.2f} "
+                f"seg_fg={require_seg_fg} type_conf={type_confidence_threshold:.2f}"
+            )
         elif fg_threshold is not None and fg_threshold > 0:
             label = f"seg-thr={fg_threshold:.2f}"
         else:
@@ -333,17 +411,28 @@ def compute_val_metrics(model, dataloader, device, two_head=False,
         print(f"  MARIDA MD IoU (1+2): {debris_metrics['marida_md_IoU']:.4f}")
         print(f"  Plastic IoU: {debris_metrics['plastic_IoU']:.4f}  "
               f"R={debris_metrics['plastic_recall']:.3f}")
+        if two_head:
+            print(
+                f"  Binary head MD (thr={debris_threshold:.2f}): "
+                f"R={debris_metrics['binary_head_md_recall']:.3f}  "
+                f"P={debris_metrics['binary_head_md_precision']:.3f}"
+            )
         print(f"  Binary foreground IoU (1+2+3): {debris_metrics['binary_foreground_IoU']:.4f}")
     return debris_metrics
 
 
 def compute_md_outlier_metrics(
-    model, dataloader, device, debris_threshold=0.35, verbose=True,
+    model, dataloader, device, debris_threshold=0.35,
+    type_confidence_threshold=0.0, require_seg_fg=False,
+    postprocess=False, verbose=True,
 ):
     """Validation for outlier-first training: two-head decode + MD binary stats."""
     return compute_val_metrics(
         model, dataloader, device,
         two_head=True, debris_threshold=debris_threshold,
+        type_confidence_threshold=type_confidence_threshold,
+        require_seg_fg=require_seg_fg,
+        postprocess=postprocess,
         verbose=verbose,
     )
 
@@ -365,13 +454,40 @@ def _eval_batch(model, images, mask_np, device, cfg, use_two_head):
         seg_p, debris_p, type_p = predict_with_tta_two_head(
             model, images, device, scales=scales, use_crf=use_crf
         )
-        pred = decode_two_head(seg_p, debris_p, type_p, cfg.get("debris_threshold", 0.5))[0]
+        pred = decode_two_head(
+            seg_p, debris_p, type_p,
+            cfg.get("debris_threshold", 0.5),
+            type_confidence_threshold=cfg.get("type_confidence_threshold", 0.0),
+            require_seg_fg=cfg.get("require_seg_fg", False),
+        )[0]
     else:
         seg_p = predict_with_tta_softmax(model, images, device, scales=scales, use_crf=use_crf)
         pred = decode_softmax(seg_p)
         if pred.ndim == 3:
             pred = pred[0]
-    return postprocess_predictions(pred, min_component_size=min_size)
+    if min_size and min_size > 0:
+        return postprocess_predictions(pred, min_component_size=min_size)
+    return pred
+
+
+def evaluate_loader_with_config(
+    model, dataloader, device, cfg, use_two_head, progress_desc=None,
+):
+    """Full confusion-matrix metrics for one decode/TTA/postprocess config."""
+    conf_matrix = np.zeros((4, 4), dtype=np.int64)
+    iterator = dataloader
+    if progress_desc is not None:
+        iterator = tqdm(dataloader, desc=progress_desc, leave=False)
+    with torch.no_grad():
+        for images, masks in iterator:
+            images = images.to(device)
+            mask_np = masks.numpy().squeeze()
+            pred = _eval_batch(model, images, mask_np, device, cfg, use_two_head)
+            update_confusion_matrix(conf_matrix, mask_np, pred)
+    per_class = calculate_metrics(conf_matrix)
+    debris = calculate_debris_metrics(conf_matrix)
+    debris["per_class"] = per_class
+    return debris
 
 
 def _run_val_config(model, val_loader, device, cfg, use_two_head, progress_desc=None):
@@ -385,6 +501,157 @@ def _run_val_config(model, val_loader, device, cfg, use_two_head, progress_desc=
         pred = _eval_batch(model, images, mask_np, device, cfg, use_two_head)
         update_confusion_matrix(conf_matrix, mask_np, pred)
     return calculate_debris_metrics(conf_matrix)["mIoU_foreground"]
+
+
+def tune_thresholds_md_plastic(
+    model,
+    val_loader,
+    device,
+    use_two_head=False,
+    *,
+    fast=True,
+    md_weight=0.5,
+    plastic_weight=0.5,
+    plastic_precision_weight=0.0,
+    preferred_threshold=None,
+    preferred_threshold_tol=0.01,
+):
+    """
+    Tune decode/postprocess on validation using MD+plastic thesis score
+    (not mIoU fg alone — avoids thr=0.6 killing plastic).
+    """
+    from training_stability import md_plastic_checkpoint_score
+
+    if fast:
+        debris_threshold_grid = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+        scale_options = [(1.0,)]
+        crf_options = [False]
+        min_size_options = (0, 4, 8)
+    else:
+        debris_threshold_grid = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55]
+        scale_options = [(1.0,), (0.75, 1.0, 1.25)]
+        crf_options = [False, True]
+        min_size_options = (0, 4, 8, 12)
+
+    configs = []
+    for scales in scale_options:
+        for use_crf in crf_options:
+            for min_size in min_size_options:
+                if use_two_head:
+                    for debris_thr in debris_threshold_grid:
+                        configs.append({
+                            "decode_mode": "two_head",
+                            "debris_threshold": debris_thr,
+                            "type_confidence_threshold": 0.0,
+                            "require_seg_fg": False,
+                            "tta_scales": list(scales),
+                            "use_crf": use_crf,
+                            "min_component_size": min_size,
+                        })
+                else:
+                    configs.append({
+                        "decode_mode": "softmax",
+                        "tta_scales": list(scales),
+                        "use_crf": use_crf,
+                        "min_component_size": min_size,
+                    })
+
+    model.eval()
+    best_score = -1.0
+    best_cfg = {}
+    leaderboard = []
+    print(
+        f"[tune] MD+plastic score (md={md_weight} pl={plastic_weight} "
+        f"prec={plastic_precision_weight}) — {len(configs)} configs "
+        f"({'fast' if fast else 'full'})"
+    )
+    with torch.no_grad():
+        for i, cfg in enumerate(tqdm(configs, desc="Tune MD+plastic", leave=False)):
+            metrics = evaluate_loader_with_config(
+                model, val_loader, device, cfg, use_two_head,
+                progress_desc=f"cfg {i + 1}/{len(configs)}",
+            )
+            score = md_plastic_checkpoint_score(
+                metrics,
+                md_weight=md_weight,
+                plastic_weight=plastic_weight,
+                plastic_precision_weight=plastic_precision_weight,
+            )
+            row = {
+                **cfg,
+                "val_md_plastic_score": float(score),
+                "val_mIoU_fg": float(metrics["mIoU_foreground"]),
+                "val_md_iou": float(metrics["marida_md_IoU"]),
+                "val_plastic_iou": float(metrics["plastic_IoU"]),
+                "val_plastic_precision": float(metrics["per_class"][1]["Precision"]),
+                "val_plastic_recall": float(metrics["plastic_recall"]),
+            }
+            leaderboard.append(row)
+            if score > best_score:
+                best_score = score
+                best_cfg = row
+
+    if preferred_threshold is not None and leaderboard:
+        best_cfg = select_md_plastic_tune_config(
+            leaderboard,
+            preferred_threshold=preferred_threshold,
+            score_tol=preferred_threshold_tol,
+        )
+    else:
+        best_cfg = dict(best_cfg)
+    return best_cfg, leaderboard
+
+
+def select_md_plastic_tune_config(
+    leaderboard,
+    *,
+    preferred_threshold=None,
+    score_tol=0.01,
+):
+    """
+    Pick tune winner; prefer training threshold when within score_tol of best val score.
+    Reduces val-tune thr=0.30 hurting test generalization.
+    """
+    if not leaderboard:
+        return {}
+    best_score = max(r["val_md_plastic_score"] for r in leaderboard)
+
+    def _sort_key(row):
+        thr_pen = 0.0
+        if preferred_threshold is not None:
+            thr_pen = abs(float(row.get("debris_threshold", 0.5)) - preferred_threshold)
+        return (-row["val_md_plastic_score"], thr_pen)
+
+    candidates = [
+        r for r in leaderboard
+        if r["val_md_plastic_score"] >= best_score - score_tol
+    ]
+    return dict(sorted(candidates, key=_sort_key)[0])
+
+
+def eval_config_from_tune_row(row):
+    """Strip validation metric keys from a tune leaderboard row."""
+    return {k: v for k, v in row.items() if not k.startswith("val_")}
+
+
+def training_baseline_eval_config(two_head=True, debris_threshold=0.40):
+    """Match md_outlier training validation decode (thr=0.40, no gates/CRF)."""
+    if not two_head:
+        return {
+            "decode_mode": "softmax",
+            "tta_scales": [1.0],
+            "use_crf": False,
+            "min_component_size": 0,
+        }
+    return {
+        "decode_mode": "two_head",
+        "debris_threshold": debris_threshold,
+        "type_confidence_threshold": 0.0,
+        "require_seg_fg": False,
+        "tta_scales": [1.0],
+        "use_crf": False,
+        "min_component_size": 0,
+    }
 
 
 def tune_thresholds_on_val(model, val_loader, device, use_two_head=False,

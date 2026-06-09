@@ -255,6 +255,11 @@ class MARIDADataset(Dataset):
         enable_copy_paste=True,
         copy_paste_prob=0.5,
         prefer_plastic=True,
+        copy_paste_min_pixels=0,
+        copy_paste_max_instances=1,
+        copy_paste_scale_range=(1.0, 1.0),
+        copy_paste_max_scale=4.0,
+        copy_paste_max_attempts=3,
         return_paste_stats=False,
         normalize=True,
     ):
@@ -264,6 +269,11 @@ class MARIDADataset(Dataset):
         self.enable_copy_paste = enable_copy_paste
         self.copy_paste_prob = copy_paste_prob
         self.prefer_plastic = prefer_plastic
+        self.copy_paste_min_pixels = int(copy_paste_min_pixels)
+        self.copy_paste_max_instances = max(1, int(copy_paste_max_instances))
+        self.copy_paste_scale_range = tuple(copy_paste_scale_range)
+        self.copy_paste_max_scale = float(copy_paste_max_scale)
+        self.copy_paste_max_attempts = max(1, int(copy_paste_max_attempts))
         self.return_paste_stats = return_paste_stats
         self.normalize = normalize
         self.patches_dir = os.path.join(root_dir, "patches")
@@ -285,6 +295,8 @@ class MARIDADataset(Dataset):
 
         self._debris_flags = None
         self._plastic_flags = None
+        self._debris_donor_indices = None
+        self._plastic_donor_indices = None
 
     def __len__(self):
         return len(self.image_names)
@@ -304,6 +316,21 @@ class MARIDADataset(Dataset):
             except Exception:
                 self._debris_flags.append(False)
                 self._plastic_flags.append(False)
+        self._debris_donor_indices = [
+            i for i, flag in enumerate(self._debris_flags) if flag
+        ]
+        self._plastic_donor_indices = [
+            i for i, flag in enumerate(self._plastic_flags) if flag
+        ]
+
+    def _find_donor_with_debris(self):
+        """Pick a random patch with foreground debris; prefer plastic donors when enabled."""
+        self._cache_debris_flags()
+        if self.prefer_plastic and self._plastic_donor_indices:
+            return random.choice(self._plastic_donor_indices)
+        if self._debris_donor_indices:
+            return random.choice(self._debris_donor_indices)
+        return random.randint(0, len(self) - 1)
 
     def has_debris(self, idx):
         if self._debris_flags is not None:
@@ -363,58 +390,96 @@ class MARIDADataset(Dataset):
 
         return img_14ch, mapped_mask
 
+    @staticmethod
+    def _resize_fg_patch(roi_img, roi_mask, roi_fg, out_h, out_w):
+        """Upscale donor fg patch — linear for image, nearest for class mask."""
+        in_h, in_w = roi_fg.shape
+        if in_h == out_h and in_w == out_w:
+            return roi_img, roi_mask, roi_fg
+        try:
+            import cv2
+            roi_img_r = cv2.resize(roi_img, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+            roi_mask_r = cv2.resize(
+                roi_mask.astype(np.uint8), (out_w, out_h), interpolation=cv2.INTER_NEAREST,
+            )
+            roi_fg_r = cv2.resize(
+                roi_fg.astype(np.uint8), (out_w, out_h), interpolation=cv2.INTER_NEAREST,
+            ) > 0
+            return roi_img_r, roi_mask_r, roi_fg_r
+        except ImportError:
+            y_idx = (np.arange(out_h) * in_h / out_h).astype(np.int64)
+            x_idx = (np.arange(out_w) * in_w / out_w).astype(np.int64)
+            roi_img_r = roi_img[y_idx][:, x_idx]
+            roi_mask_r = roi_mask[y_idx][:, x_idx]
+            roi_fg_r = roi_fg[y_idx][:, x_idx]
+            return roi_img_r, roi_mask_r, roi_fg_r
+
+    def _paste_one_instance(self, img1, mask1, img2, mask2):
+        if self.prefer_plastic:
+            paste_mask = (mask2 == 1)
+        else:
+            paste_mask = (mask2 == 1) | (mask2 == 2)
+        ys, xs = np.where(paste_mask)
+        if len(ys) == 0:
+            return 0
+        h, w = mask1.shape
+        ymin, ymax = int(ys.min()), int(ys.max())
+        xmin, xmax = int(xs.min()), int(xs.max())
+        roi_img = img2[ymin : ymax + 1, xmin : xmax + 1, :].copy()
+        roi_mask = mask2[ymin : ymax + 1, xmin : xmax + 1].copy()
+        roi_fg = paste_mask[ymin : ymax + 1, xmin : xmax + 1]
+        box_h, box_w = roi_fg.shape
+        if box_h < 1 or box_w < 1:
+            return 0
+
+        scale_lo, scale_hi = self.copy_paste_scale_range
+        scale = random.uniform(scale_lo, scale_hi) if scale_hi > scale_lo else scale_lo
+        if self.copy_paste_min_pixels > 0 and roi_fg.sum() > 0:
+            area_scale = (self.copy_paste_min_pixels / roi_fg.sum()) ** 0.5
+            scale = max(scale, min(area_scale, self.copy_paste_max_scale))
+
+        new_h = max(1, min(h, int(round(box_h * scale))))
+        new_w = max(1, min(w, int(round(box_w * scale))))
+        if new_h != box_h or new_w != box_w:
+            roi_img, roi_mask, roi_fg = self._resize_fg_patch(
+                roi_img, roi_mask, roi_fg, new_h, new_w,
+            )
+
+        box_h, box_w = roi_fg.shape
+        if box_h > h or box_w > w:
+            return 0
+
+        for _ in range(self.copy_paste_max_attempts):
+            y0 = random.randint(0, h - box_h)
+            x0 = random.randint(0, w - box_w)
+            target_mask = mask1[y0 : y0 + box_h, x0 : x0 + box_w]
+            paste_where = roi_fg & (target_mask == 0)
+            if not paste_where.any():
+                continue
+            target_img = img1[y0 : y0 + box_h, x0 : x0 + box_w, :]
+            target_img[paste_where] = roi_img[paste_where]
+            target_mask[paste_where] = roi_mask[paste_where]
+            img1[y0 : y0 + box_h, x0 : x0 + box_w, :] = target_img
+            mask1[y0 : y0 + box_h, x0 : x0 + box_w] = target_mask
+            return int(paste_where.sum())
+        return 0
+
     def apply_copy_paste(self, img1, mask1):
-        pasted_pixels = 0
         if random.random() > self.copy_paste_prob:
-            return img1, mask1, pasted_pixels
-
-        candidates = list(range(len(self.image_names)))
-        random.shuffle(candidates)
-
-        for idx2 in candidates[: min(30, len(candidates))]:
-            img2, mask2 = self._load_image_and_mask(idx2)
-
-            if self.prefer_plastic and np.any(mask2 == 1):
-                donor_mask = mask2 == 1
-            elif np.any((mask2 == 1) | (mask2 == 2)):
-                donor_mask = (mask2 == 1) | (mask2 == 2)
-            else:
-                continue
-
-            donor_ys, donor_xs = np.where(donor_mask)
-            if len(donor_ys) == 0:
-                continue
-
-            y_min, y_max = donor_ys.min(), donor_ys.max()
-            x_min, x_max = donor_xs.min(), donor_xs.max()
-            patch_h = y_max - y_min + 1
-            patch_w = x_max - x_min + 1
-
-            water_mask = mask1 == 0
-            h, w = mask1.shape
-            if patch_h > h or patch_w > w:
-                continue
-
-            placed = False
-            for _ in range(15):
-                ry = random.randint(0, h - patch_h)
-                rx = random.randint(0, w - patch_w)
-                target_region = water_mask[ry:ry + patch_h, rx:rx + patch_w]
-                local_ys = donor_ys - y_min
-                local_xs = donor_xs - x_min
-                if target_region[local_ys, local_xs].all():
-                    dst_ys = ry + local_ys
-                    dst_xs = rx + local_xs
-                    img1[dst_ys, dst_xs, :] = img2[donor_ys, donor_xs, :]
-                    mask1[dst_ys, dst_xs] = mask2[donor_ys, donor_xs]
-                    pasted_pixels = len(donor_ys)
-                    placed = True
-                    break
-
-            if placed:
+            return img1, mask1, 0
+        img1 = img1.copy()
+        mask1 = mask1.copy()
+        pasted = 0
+        for _ in range(self.copy_paste_max_instances):
+            donor_idx = self._find_donor_with_debris()
+            img2, mask2 = self._load_image_and_mask(donor_idx)
+            pasted += self._paste_one_instance(img1, mask1, img2, mask2)
+            if (
+                self.copy_paste_min_pixels > 0
+                and pasted >= self.copy_paste_min_pixels
+            ):
                 break
-
-        return img1, mask1, pasted_pixels
+        return img1, mask1, pasted
 
     def __getitem__(self, idx):
         img, mask = self._load_image_and_mask(idx)

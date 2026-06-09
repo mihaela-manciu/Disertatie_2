@@ -92,11 +92,18 @@ from metrics_reporting import plot_training_dashboard
 from models import UNetResNet50, TAUNetResNet50, build_model
 from experiment_timing import fmt_duration, format_timing_dict, print_timing_block, sec_since
 from segmentation_utils import compute_md_outlier_metrics, compute_val_metrics
+from training_diagnostics import (
+    print_loss_breakdown,
+    print_train_batch_diagnostics,
+    print_validation_diagnostics,
+)
 from training_stability import (
     MetricEMA,
     ModelEMA,
     checkpoint_score,
+    is_validation_collapsed,
     md_plastic_checkpoint_score,
+    model_weights_finite,
     set_training_seed,
 )
 
@@ -155,6 +162,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
                     pixels_total += int(sum(int(m["total_pixels"]) for m in meta))
                 except Exception:
                     pass
+            if steps % 50 == 0:
+                paste_ratio = pasted_total / max(1, pixels_total)
+                print(f"[copy-paste] step {steps}: ratio={paste_ratio:.4f} pasted={pasted_total} total={pixels_total}")
         else:
             images, masks = batch
         images = images.to(device)
@@ -198,16 +208,24 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
             stepped = False
             if use_amp:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                stepped = True
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if torch.isfinite(grad_norm):
+                    scaler.step(optimizer)
+                    scaler.update()
+                    stepped = True
+                else:
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_count = 0
+                    skipped_steps += 1
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 if torch.isfinite(grad_norm):
                     optimizer.step()
                     stepped = True
                 else:
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_count = 0
                     skipped_steps += 1
             if stepped and model_ema is not None:
                 model_ema.update(model)
@@ -224,15 +242,21 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
         stepped = False
         if use_amp:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            stepped = True
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if torch.isfinite(grad_norm):
+                scaler.step(optimizer)
+                scaler.update()
+                stepped = True
+            else:
+                scaler.update()
+                skipped_steps += 1
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if torch.isfinite(grad_norm):
                 optimizer.step()
                 stepped = True
+            else:
+                skipped_steps += 1
         if stepped and model_ema is not None:
             model_ema.update(model)
             ema_updates += 1
@@ -243,6 +267,9 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, *,
 
     avg_loss = running_loss / max(1, valid_steps)
     paste_ratio = (pasted_total / max(1, pixels_total)) if pixels_total > 0 else 0.0
+
+
+
     return avg_loss, {
         "pasted_pixels": int(pasted_total),
         "total_pixels": int(pixels_total),
@@ -256,8 +283,10 @@ def validate(model, dataloader, criterion, device):
     model.eval()
     running_loss = 0.0
     valid_steps = 0
+    total_steps = 0
     with torch.no_grad():
         for images, masks in tqdm(dataloader, desc="Validation", leave=False):
+            total_steps += 1
             images = images.to(device)
             masks = masks.to(device, dtype=torch.long)
             images, masks = _sanitize_batch(images, masks)
@@ -270,14 +299,26 @@ def validate(model, dataloader, criterion, device):
             if torch.isfinite(loss):
                 running_loss += loss.item()
                 valid_steps += 1
-    return running_loss / max(1, valid_steps)
+    if valid_steps == 0:
+        avg_loss = float("nan")
+    else:
+        avg_loss = running_loss / valid_steps
+    return {
+        "loss": avg_loss,
+        "valid_steps": valid_steps,
+        "total_steps": total_steps,
+    }
 
 
 def build_criterion(class_weights, two_head, use_ohem, deep_sup_weights, device,
                     *, use_focal=True, lovasz_weight=0.3, label_smoothing=0.0,
                     debris_weight=2.0, type_weight=1.5, seg_weight=0.5,
                     binary_pos_weight=20.0, focal_gamma=1.5,
-                    training_mode="standard", binary_lovasz_weight=0.25):
+                    training_mode="standard", binary_lovasz_weight=0.25,
+                    binary_fp_weight=0.0, binary_focal_gamma=2.0,
+                    binary_fp_margin=0.15, use_binary_focal=False,
+                    fp_penalty_warmup_epochs=0, lovasz_warmup_epochs=0,
+                    type_class_weights=None):
     if training_mode == "md_outlier":
         return MDOutlierLoss(
             class_weight=class_weights,
@@ -285,11 +326,18 @@ def build_criterion(class_weights, two_head, use_ohem, deep_sup_weights, device,
             type_weight=type_weight,
             seg_weight=seg_weight,
             binary_lovasz_weight=binary_lovasz_weight,
+            binary_fp_weight=binary_fp_weight,
+            binary_focal_gamma=binary_focal_gamma,
+            binary_fp_margin=binary_fp_margin,
+            use_binary_focal=use_binary_focal,
+            fp_penalty_warmup_epochs=fp_penalty_warmup_epochs,
+            lovasz_warmup_epochs=lovasz_warmup_epochs,
             deep_sup_weights=deep_sup_weights,
             use_focal=use_focal,
             lovasz_weight=lovasz_weight,
             binary_pos_weight=binary_pos_weight,
             focal_gamma=focal_gamma,
+            type_class_weights=type_class_weights,
         ).to(device)
     if two_head:
         if use_ohem:
@@ -474,8 +522,8 @@ RECIPE_PRESETS = {
         "use_ohem": False,
         "use_deep_sup": True,
         "two_head_default": True,
-        "debris_boost": 8.0,
-        "plastic_boost": 30.0,
+        "debris_boost": 10.0,
+        "plastic_boost": 40.0,
         "lr": 1e-4,
         "decoder_lr_mult": 10.0,
         "warmup_epochs": 5,
@@ -488,35 +536,188 @@ RECIPE_PRESETS = {
         "default_epochs": 150,
         "default_patience": 35,
         "use_ssag": True,
+        "use_amp": False,
         "boundary_weight": 0.05,
         "grad_accum_steps": 4,
-        "copy_paste_prob": 0.7,
-        "tta_scales_eval": [0.75, 1.0, 1.25],
+        "copy_paste_prob": 0.80,
+        "copy_paste_min_pixels": 384,
+        "copy_paste_max_instances": 1,
+        "copy_paste_scale_range": [1.0, 2.0],
+        "copy_paste_max_scale": 2.5,
+        "copy_paste_max_attempts": 4,
+        "tta_scales_eval": [1.0],
+        "eval_tune_mode": "md_plastic",
+        "eval_fast_tune": True,
+        "eval_debris_threshold": 0.40,
+        "eval_prefer_threshold": 0.40,
+        "eval_threshold_score_tol": 0.01,
+        "eval_use_crf": False,
+        "eval_min_component_size": 0,
+        "dual_checkpoints": True,
         "backbone": "ssl4eo",
         "ema_decay": 0.999,
         "metric_ema_decay": 0.85,
+        "validate_with_ema": False,
+        "report_decode_diagnostics": True,
         "checkpoint_md_weight": 0.45,
         "checkpoint_plastic_weight": 0.30,
         "checkpoint_plastic_recall_weight": 0.25,
-        "val_debris_threshold": 0.35,
-        "debris_weight": 3.0,
-        "type_weight": 0.25,
-        "seg_weight": 0.25,
-        "binary_lovasz_weight": 0.25,
-        "binary_pos_weight": 15.0,
+        "val_debris_threshold": 0.40,
+        "type_confidence_threshold": 0.0,
+        "require_seg_fg": False,
+        "gated_debris_threshold": 0.42,
+        "gated_type_confidence_threshold": 0.50,
+        "gated_require_seg_fg": True,
+        "val_postprocess": False,
+        "debris_weight": 3.5,
+        "type_weight": 0.35,
+        "type_class_weights": [4.0, 1.0, 1.0],
+        "seg_weight": 0.50,
+        "binary_lovasz_weight": 0.05,
+        "binary_fp_weight": 0.30,
+        "binary_fp_margin": 0.25,
+        "use_binary_focal": False,
+        "fp_penalty_warmup_epochs": 10,
+        "lovasz_warmup_epochs": 5,
+        "binary_pos_weight": 18.0,
         "focal_gamma": 2.0,
         "crop_mining": True,
         "crop_size": 128,
-        "full_patch_prob": 0.5,
+        "full_patch_prob": 0.75,
         "crop_prob": 0.5,
-        "plastic_focus_prob": 0.75,
+        "plastic_focus_prob": 0.70,
         "checkpoint_mode": "md_plastic",
-        "checkpoint_md_iou_weight": 0.5,
-        "checkpoint_plastic_iou_weight": 0.5,
+        "checkpoint_md_iou_weight": 0.50,
+        "checkpoint_plastic_iou_weight": 0.35,
+        "checkpoint_plastic_precision_weight": 0.15,
+        "min_checkpoint_score": 0.02,
+        "min_checkpoint_md_iou": 0.12,
+        "max_nonfinite_skips_per_epoch": 12,
+        "collapse_stop_epochs": 2,
         "variants": ["no_aug"],
         "copy_paste_on_no_aug": True,
         "ssl4eo_strict": True,
         "seed": 42,
+    },
+    "md_outlier_v2": {
+        "training_mode": "md_outlier",
+        "class_weights": "auto",
+        "use_focal": True,
+        "lovasz_weight": 0.2,
+        "use_ohem": False,
+        "use_deep_sup": True,
+        "two_head_default": True,
+        "debris_boost": 50.0,          # crescut drastic
+        "plastic_boost": 100.0,         # crescut drastic
+        "lr": 1e-4,
+        "decoder_lr_mult": 10.0,
+        "warmup_epochs": 5,
+        "label_smoothing": 0.0,         # eliminat smoothing
+        "class_weights_from_data": True,
+        "class_weight_max": 20.0,       # crescut
+        "freeze_encoder_epochs": 5,
+        "use_ssag": True,
+        "copy_paste_prob": 0.8,         # crescut
+        "crop_mining": False,           # DEZACTIVAT temporar
+        "full_patch_prob": 1.0,         # forțat patchete întregi
+        "grad_accum_steps": 2,
+        "binary_pos_weight": 50.0,      # crescut puternic
+        "binary_lovasz_weight": 0.3,    # activat
+        "binary_fp_weight": 0.2,        # penalizare false positive
+        "use_binary_focal": True,       # focal loss pe debris head
+        "binary_focal_gamma": 2.0,
+        "val_debris_threshold": 0.2,    # prag mai jos pentru validare
+        "type_confidence_threshold": 0.2,
+        "require_seg_fg": False,        # dezactivat gating
+        "seg_weight": 1.0,              # mărit greutatea seg head
+        "debris_weight": 2.0,
+        "type_weight": 0.5,
+    },
+    "md_outlier_refine": {
+        "training_mode": "md_outlier",
+        "class_weights": "auto",
+        "use_focal": True,
+        "lovasz_weight": 0.10,
+        "use_ohem": False,
+        "use_deep_sup": True,
+        "two_head_default": True,
+        "debris_boost": 12.0,
+        "plastic_boost": 40.0,
+        "lr": 5e-5,
+        "decoder_lr_mult": 10.0,
+        "warmup_epochs": 2,
+        "label_smoothing": 0.05,
+        "class_weights_from_data": True,
+        "class_weight_max": 8.0,
+        "freeze_encoder_epochs": 0,
+        "encoder_unfreeze_ramp_epochs": 0,
+        "encoder_lr_ramp_mult": 0.25,
+        "default_epochs": 80,
+        "default_patience": 25,
+        "use_ssag": True,
+        "use_amp": False,
+        "boundary_weight": 0.05,
+        "grad_accum_steps": 4,
+        "copy_paste_prob": 0.55,
+        "copy_paste_min_pixels": 256,
+        "copy_paste_max_instances": 1,
+        "copy_paste_scale_range": [1.0, 1.8],
+        "copy_paste_max_scale": 2.0,
+        "copy_paste_max_attempts": 4,
+        "tta_scales_eval": [1.0],
+        "eval_tune_mode": "md_plastic",
+        "eval_fast_tune": True,
+        "eval_debris_threshold": 0.40,
+        "eval_prefer_threshold": 0.40,
+        "eval_threshold_score_tol": 0.01,
+        "eval_use_crf": False,
+        "eval_min_component_size": 0,
+        "dual_checkpoints": True,
+        "backbone": "ssl4eo",
+        "ema_decay": 0.999,
+        "metric_ema_decay": 0.85,
+        "validate_with_ema": False,
+        "report_decode_diagnostics": True,
+        "checkpoint_md_weight": 0.45,
+        "checkpoint_plastic_weight": 0.30,
+        "checkpoint_plastic_recall_weight": 0.25,
+        "val_debris_threshold": 0.40,
+        "type_confidence_threshold": 0.0,
+        "require_seg_fg": False,
+        "gated_debris_threshold": 0.42,
+        "gated_type_confidence_threshold": 0.50,
+        "gated_require_seg_fg": True,
+        "val_postprocess": False,
+        "debris_weight": 3.5,
+        "type_weight": 0.35,
+        "type_class_weights": [4.0, 1.0, 1.0],
+        "seg_weight": 0.50,
+        "binary_lovasz_weight": 0.05,
+        "binary_fp_weight": 0.25,
+        "binary_fp_margin": 0.25,
+        "use_binary_focal": False,
+        "fp_penalty_warmup_epochs": 5,
+        "lovasz_warmup_epochs": 3,
+        "binary_pos_weight": 18.0,
+        "focal_gamma": 2.0,
+        "crop_mining": True,
+        "crop_size": 128,
+        "full_patch_prob": 0.85,
+        "crop_prob": 0.5,
+        "plastic_focus_prob": 0.65,
+        "checkpoint_mode": "md_plastic",
+        "checkpoint_md_iou_weight": 0.50,
+        "checkpoint_plastic_iou_weight": 0.35,
+        "checkpoint_plastic_precision_weight": 0.15,
+        "min_checkpoint_score": 0.02,
+        "min_checkpoint_md_iou": 0.15,
+        "max_nonfinite_skips_per_epoch": 12,
+        "collapse_stop_epochs": 2,
+        "variants": ["no_aug"],
+        "copy_paste_on_no_aug": True,
+        "ssl4eo_strict": True,
+        "seed": 42,
+        "init_weights_path": "results_3/no_aug/taunet_resnet50_best.pth",
     },
 }
 
@@ -531,10 +732,22 @@ def print_recipe_config(recipe: str, preset: dict, *, two_head: bool, model_key:
         f"mode={preset.get('training_mode', 'standard')} "
         f"lr={preset.get('lr')} freeze={preset.get('freeze_encoder_epochs')} "
         f"debris_boost={preset.get('debris_boost')} plastic_boost={preset.get('plastic_boost')} "
-        f"copy_paste={preset.get('copy_paste_prob')} ema={preset.get('ema_decay', 0)} "
+        f"copy_paste={preset.get('copy_paste_prob')} "
+        f"cp_min_px={preset.get('copy_paste_min_pixels', 0)} "
+        f"cp_inst={preset.get('copy_paste_max_instances', 1)} "
+        f"cp_max_scale={preset.get('copy_paste_max_scale', 4.0)} "
+        f"ema={preset.get('ema_decay', 0)} "
         f"lovasz={preset.get('lovasz_weight')} crop_mining={preset.get('crop_mining', False)} "
         f"full_patch_prob={preset.get('full_patch_prob', 0)} "
         f"ckpt_mode={preset.get('checkpoint_mode', 'score_ema')} "
+        f"min_ckpt={preset.get('min_checkpoint_score', 0)} "
+        f"min_ckpt_md={preset.get('min_checkpoint_md_iou', 0)} "
+        f"binary_pos_w={preset.get('binary_pos_weight')} "
+        f"amp={preset.get('use_amp', 'auto')} ema_val={preset.get('validate_with_ema', False)} "
+        f"val_thr={preset.get('val_debris_threshold', 0.35)} "
+        f"seg_fg={preset.get('require_seg_fg', False)} "
+        f"type_conf={preset.get('type_confidence_threshold', 0.0)} "
+        f"diag={preset.get('report_decode_diagnostics', False)} "
         f"loss_dtype_guard={dtype_guard}"
     )
     print(f"[config] losses module: {losses_path}")
@@ -577,6 +790,7 @@ def run_training(
     max_steps_per_epoch=None,
     recipe="pretrained_strong",
     ssl4eo_strict=None,
+    init_checkpoint=None,
 ):
     model_key = model_key.lower()
     if recipe not in RECIPE_PRESETS:
@@ -598,7 +812,10 @@ def run_training(
     deep_sup_weights = DEEP_SUP_WEIGHTS if use_deep_sup else []
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = bool(use_amp and device.type == "cuda")
+    if preset.get("use_amp") is not None:
+        use_amp = bool(preset["use_amp"] and device.type == "cuda")
+    else:
+        use_amp = bool(use_amp and device.type == "cuda")
     if pin_memory is None:
         pin_memory = device.type == "cuda" and num_workers > 0
     os.makedirs(saved_models_dir, exist_ok=True)
@@ -606,11 +823,19 @@ def run_training(
         os.makedirs(run_dir, exist_ok=True)
 
     checkpoint_path = os.path.join(saved_models_dir, f"{model_key}_best.pth")
+    checkpoint_plastic_path = os.path.join(saved_models_dir, f"{model_key}_best_plastic.pth")
+    checkpoint_md_path = os.path.join(saved_models_dir, f"{model_key}_best_md.pth")
     checkpoint_ema_path = os.path.join(saved_models_dir, f"{model_key}_best_score_ema.pth")
+    dual_checkpoints = bool(preset.get("dual_checkpoints", False))
     state_path = os.path.join(saved_models_dir, f"{model_key}_state.pth")
     checkpoint_mode = preset.get("checkpoint_mode", "score_ema")
     ckpt_md_iou_w = float(preset.get("checkpoint_md_iou_weight", 0.5))
     ckpt_plastic_iou_w = float(preset.get("checkpoint_plastic_iou_weight", 0.5))
+    ckpt_plastic_prec_w = float(preset.get("checkpoint_plastic_precision_weight", 0.0))
+    max_nonfinite_skips = int(preset.get("max_nonfinite_skips_per_epoch", 0))
+    collapse_stop_epochs = int(preset.get("collapse_stop_epochs", 2))
+    min_checkpoint_score = float(preset.get("min_checkpoint_score", 0.0))
+    min_checkpoint_md_iou = float(preset.get("min_checkpoint_md_iou", 0.0))
     history_path = (
         os.path.join(run_dir, "istoric_antrenare.csv")
         if run_dir
@@ -628,6 +853,9 @@ def run_training(
     timing = {}
 
     cp_prob = preset.get("copy_paste_prob", 0.5)
+    cp_scale = preset.get("copy_paste_scale_range", (1.0, 1.0))
+    if isinstance(cp_scale, list):
+        cp_scale = tuple(cp_scale)
 
     t_step = time.perf_counter()
     enable_copy_paste = augmentation_enabled or preset.get("copy_paste_on_no_aug", False)
@@ -638,6 +866,11 @@ def run_training(
         enable_copy_paste=enable_copy_paste,
         copy_paste_prob=cp_prob if enable_copy_paste else 0.0,
         prefer_plastic=True,
+        copy_paste_min_pixels=int(preset.get("copy_paste_min_pixels", 0)),
+        copy_paste_max_instances=int(preset.get("copy_paste_max_instances", 1)),
+        copy_paste_scale_range=cp_scale,
+        copy_paste_max_scale=float(preset.get("copy_paste_max_scale", 4.0)),
+        copy_paste_max_attempts=int(preset.get("copy_paste_max_attempts", 3)),
         return_paste_stats=True,
     )
     use_crop_mining = preset.get("crop_mining", False)
@@ -687,6 +920,14 @@ def run_training(
 
     timing["setup_dataloaders_sec"] = sec_since(t_step)
 
+    diag_train_batch = None
+    diag_val_batch = None
+    try:
+        diag_train_batch = next(iter(train_loader))
+        diag_val_batch = next(iter(val_loader))
+    except StopIteration:
+        print("[diag] warning: empty dataloader — skipping startup batch diagnostics")
+
     t_step = time.perf_counter()
     use_ssag = preset.get("use_ssag", False)
     backbone = preset.get("backbone", "ssl4eo")
@@ -708,6 +949,18 @@ def run_training(
     ).to(device)
     if hasattr(model, "backbone_source"):
         print(f"[backbone] active encoder weights: {model.backbone_source}")
+
+    init_path = init_checkpoint or preset.get("init_weights_path")
+    if init_path:
+        if not os.path.isabs(init_path):
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(saved_models_dir)))
+            init_path = os.path.join(project_root, init_path)
+        if os.path.isfile(init_path):
+            model.load_state_dict(torch.load(init_path, map_location=device))
+            print(f"[init] Loaded weights from {init_path}")
+        else:
+            print(f"[init] WARNING: init weights not found: {init_path}")
+
     timing["setup_model_sec"] = sec_since(t_step)
 
     t_step = time.perf_counter()
@@ -735,6 +988,13 @@ def run_training(
         focal_gamma=preset.get("focal_gamma", 1.5),
         training_mode=training_mode,
         binary_lovasz_weight=preset.get("binary_lovasz_weight", 0.25),
+        binary_fp_weight=preset.get("binary_fp_weight", 0.0),
+        binary_focal_gamma=preset.get("binary_focal_gamma", 2.0),
+        binary_fp_margin=preset.get("binary_fp_margin", 0.15),
+        use_binary_focal=preset.get("use_binary_focal", False),
+        fp_penalty_warmup_epochs=preset.get("fp_penalty_warmup_epochs", 0),
+        lovasz_warmup_epochs=preset.get("lovasz_warmup_epochs", 0),
+        type_class_weights=preset.get("type_class_weights"),
     )
 
     boundary_weight = preset.get("boundary_weight", 0.0)
@@ -749,9 +1009,13 @@ def run_training(
             self.bdry_w = bdry_w
         def forward(self, outputs, target):
             loss = self.main(outputs, target)
+            if not torch.isfinite(loss):
+                return loss
             if self.bdry is not None and self.bdry_w > 0:
                 seg = outputs["seg"] if isinstance(outputs, dict) else outputs
-                loss = loss + self.bdry_w * self.bdry(seg, target)
+                bdry_l = self.bdry(seg, target)
+                if torch.isfinite(bdry_l):
+                    loss = loss + self.bdry_w * bdry_l
             return loss
 
     criterion = _CombinedCriterion(base_criterion, boundary_loss_fn, boundary_weight)
@@ -796,6 +1060,14 @@ def run_training(
     ckpt_plastic_rec_w = preset.get("checkpoint_plastic_recall_weight")
     val_fg_threshold = preset.get("val_fg_threshold", 0.20)
     val_debris_threshold = preset.get("val_debris_threshold", 0.35)
+    type_confidence_threshold = float(preset.get("type_confidence_threshold", 0.0))
+    require_seg_fg = bool(preset.get("require_seg_fg", False))
+    validate_with_ema = bool(preset.get("validate_with_ema", False))
+    val_postprocess = bool(preset.get("val_postprocess", False))
+    report_decode_diagnostics = bool(preset.get("report_decode_diagnostics", False))
+    gated_debris_threshold = float(preset.get("gated_debris_threshold", 0.42))
+    gated_type_conf_threshold = float(preset.get("gated_type_confidence_threshold", 0.50))
+    gated_require_seg_fg = bool(preset.get("gated_require_seg_fg", True))
     encoder_unfreeze_ramp = int(preset.get("encoder_unfreeze_ramp_epochs", 0))
     encoder_lr_ramp_mult = float(preset.get("encoder_lr_ramp_mult", 0.25))
     score_ema = MetricEMA(decay=metric_ema_decay)
@@ -805,15 +1077,21 @@ def run_training(
     best_val_plastic_iou = -1.0
     best_val_md_plastic_score = -1.0
     best_val_md_plastic_epoch = 0
+    best_plastic_only_iou = -1.0
+    best_plastic_only_epoch = 0
+    best_md_only_iou = -1.0
+    best_md_only_epoch = 0
     best_checkpoint_score = -1.0
     best_checkpoint_score_ema = -1.0
     epochs_no_improve = 0
+    consecutive_collapsed_epochs = 0
     epochs_ran = 0
     start_epoch = 0
     istoric = {
         "train_loss": [], "val_loss": [], "val_miou_fg": [], "val_fg_binary_iou": [],
         "val_md_iou": [], "val_binary_debris_iou": [], "val_plastic_iou": [],
         "val_plastic_recall": [],
+        "val_plastic_precision": [],
         "val_md_plastic_ckpt_score": [],
         "val_checkpoint_score": [], "val_checkpoint_score_ema": [], "lr": [],
         "epoch_sec": [], "train_sec": [], "val_sec": [], "val_miou_sec": [],
@@ -857,6 +1135,17 @@ def run_training(
     timing["resume_sec"] = sec_since(t_step)
     model_ema = ModelEMA(model, decay=ema_decay) if ema_decay > 0 else None
 
+    if report_decode_diagnostics and diag_train_batch is not None:
+        if len(diag_train_batch) == 3:
+            tr_im, tr_mk, _ = diag_train_batch
+        else:
+            tr_im, tr_mk = diag_train_batch
+        print_train_batch_diagnostics(tr_im, tr_mk, tag="startup train")
+        if diag_val_batch is not None:
+            vl_im, vl_mk = diag_val_batch
+            print_train_batch_diagnostics(vl_im, vl_mk, tag="startup val")
+            print_loss_breakdown(model, criterion, vl_im, vl_mk, device, tag="startup val")
+
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     stop_file = os.path.join(_script_dir, "STOP")
 
@@ -892,6 +1181,10 @@ def run_training(
         epochs_ran = epoch + 1
         print(f"\nEpoch {epoch + 1}/{epochs}")
         lr_curent = scheduler.get_last_lr()[0]
+        if hasattr(criterion, "main") and hasattr(criterion.main, "set_epoch"):
+            criterion.main.set_epoch(epoch)
+        elif hasattr(criterion, "set_epoch"):
+            criterion.set_epoch(epoch)
 
         freeze_enc_epochs = preset.get("freeze_encoder_epochs", 0)
         if hasattr(model, "freeze_encoder") and freeze_enc_epochs > 0:
@@ -929,29 +1222,62 @@ def run_training(
             train_sec = sec_since(t_train)
 
             t_val = time.perf_counter()
-            val_loss = validate(model, val_loader, criterion, device)
+            val_result = validate(model, val_loader, criterion, device)
+            val_loss = val_result["loss"]
             val_part_sec = sec_since(t_val)
 
             t_miou = time.perf_counter()
-            if training_mode == "md_outlier":
-                val_metrics = compute_md_outlier_metrics(
-                    model, val_loader, device,
-                    debris_threshold=val_debris_threshold, verbose=True,
-                )
-            else:
-                val_metrics = compute_val_metrics(
-                    model, val_loader, device, two_head=False,
-                    fg_threshold=val_fg_threshold, verbose=True,
-                )
-                if two_head:
-                    th_metrics = compute_val_metrics(
-                        model, val_loader, device, two_head=True, verbose=False,
+            ema_backup = None
+            if validate_with_ema and model_ema is not None:
+                ema_backup = model_ema.apply(model)
+            try:
+                if training_mode == "md_outlier":
+                    val_metrics = compute_md_outlier_metrics(
+                        model, val_loader, device,
+                        debris_threshold=val_debris_threshold,
+                        type_confidence_threshold=type_confidence_threshold,
+                        require_seg_fg=require_seg_fg,
+                        postprocess=val_postprocess,
+                        verbose=True,
                     )
-                    print(
-                        f"  [two-head decode] mIoU (fg): {th_metrics['mIoU_foreground']:.4f} | "
-                        f"Plastic IoU: {th_metrics['plastic_IoU']:.4f} | "
-                        f"Fg-bin IoU: {th_metrics['binary_foreground_IoU']:.4f}"
+                else:
+                    val_metrics = compute_val_metrics(
+                        model, val_loader, device, two_head=False,
+                        fg_threshold=val_fg_threshold, verbose=True,
                     )
+                    if two_head:
+                        th_metrics = compute_val_metrics(
+                            model, val_loader, device, two_head=True, verbose=False,
+                        )
+                        print(
+                            f"  [two-head decode] mIoU (fg): {th_metrics['mIoU_foreground']:.4f} | "
+                            f"Plastic IoU: {th_metrics['plastic_IoU']:.4f} | "
+                            f"Fg-bin IoU: {th_metrics['binary_foreground_IoU']:.4f}"
+                        )
+            finally:
+                if ema_backup is not None:
+                    ModelEMA.restore(model, ema_backup)
+
+            if report_decode_diagnostics and (
+                epoch < 10 or (epoch + 1) % 5 == 0
+            ):
+                print_validation_diagnostics(
+                    model,
+                    val_loader,
+                    device,
+                    epoch=epoch + 1,
+                    debris_threshold=val_debris_threshold,
+                    gated_debris_threshold=gated_debris_threshold,
+                    gated_type_confidence=gated_type_conf_threshold,
+                    gated_require_seg_fg=gated_require_seg_fg,
+                    max_batches=2,
+                )
+                if epoch == 0 and diag_val_batch is not None:
+                    vl_im, vl_mk = diag_val_batch
+                    print_loss_breakdown(
+                        model, criterion, vl_im, vl_mk, device, tag=f"epoch {epoch + 1} val",
+                    )
+
             val_miou_fg = val_metrics["mIoU_foreground"]
             val_plastic_iou = val_metrics["plastic_IoU"]
             val_fg_binary = val_metrics["binary_foreground_IoU"]
@@ -977,6 +1303,7 @@ def run_training(
                 val_metrics,
                 md_weight=ckpt_md_iou_w,
                 plastic_weight=ckpt_plastic_iou_w,
+                plastic_precision_weight=ckpt_plastic_prec_w,
             )
             val_miou_sec = sec_since(t_miou)
             val_sec = round(val_part_sec + val_miou_sec, 2)
@@ -993,11 +1320,20 @@ def run_training(
         ema_info = ""
         if paste_stats.get("ema_updates"):
             ema_info = f" | EMA steps: {paste_stats['ema_updates']}"
-        md_line = f" | MD IoU: {val_md_iou:.4f}" if training_mode == "md_outlier" else ""
+        val_plastic_precision = float(
+            val_metrics.get("per_class", {}).get(1, {}).get("Precision", 0.0)
+        )
+        if training_mode == "md_outlier":
+            bin_md_r = float(val_metrics.get("binary_head_md_recall", 0.0))
+            md_line = f" | MD IoU: {val_md_iou:.4f} | BinMD R: {bin_md_r:.3f}"
+        else:
+            md_line = ""
+        val_loss_str = f"{val_loss:.4f}" if val_result["valid_steps"] > 0 else "non-finite"
         print(
-            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss_str} | "
             f"Val mIoU (fg): {val_miou_fg:.4f} | Plastic IoU: {val_plastic_iou:.4f} "
-            f"(R={val_plastic_recall:.3f}) | Fg-bin IoU: {val_fg_binary:.4f}{md_line} | "
+            f"(P={val_plastic_precision:.3f} R={val_plastic_recall:.3f}) | "
+            f"Fg-bin IoU: {val_fg_binary:.4f}{md_line} | "
             f"Score: {val_ckpt_score:.4f} (EMA {val_ckpt_score_ema:.4f}) | "
             f"MD+Pl: {val_md_plastic_ckpt:.4f} | LR: {lr_curent:.6f}{ema_info} | "
             f"Time: train {fmt_duration(train_sec)} val {fmt_duration(val_sec)} "
@@ -1016,11 +1352,14 @@ def run_training(
                 torch.save(model_ema.state_dict(model), ema_path)
 
         use_md_plastic_ckpt = checkpoint_mode == "md_plastic"
-        ckpt_improved = (
-            val_md_plastic_ckpt > best_val_md_plastic_score
-            if use_md_plastic_ckpt
-            else val_ckpt_score_ema > best_checkpoint_score_ema
-        )
+        if use_md_plastic_ckpt:
+            ckpt_improved = (
+                val_md_plastic_ckpt > best_val_md_plastic_score
+                and val_md_plastic_ckpt >= min_checkpoint_score
+                and val_md_iou >= min_checkpoint_md_iou
+            )
+        else:
+            ckpt_improved = val_ckpt_score_ema > best_checkpoint_score_ema
         if ckpt_improved:
             if use_md_plastic_ckpt:
                 best_val_md_plastic_score = val_md_plastic_ckpt
@@ -1048,14 +1387,74 @@ def run_training(
                 print(f"Early stopping după {patience} epoci fără îmbunătățire.")
                 break
 
+        if dual_checkpoints:
+            if (
+                val_plastic_iou >= min_checkpoint_score
+                and val_plastic_iou > best_plastic_only_iou
+            ):
+                best_plastic_only_iou = val_plastic_iou
+                best_plastic_only_epoch = epoch + 1
+                torch.save(model.state_dict(), checkpoint_plastic_path)
+                print(
+                    f"*** Salvat best-plastic (IoU={best_plastic_only_iou:.4f}, ep={epoch + 1}) "
+                    f"-> {checkpoint_plastic_path} ***"
+                )
+            if val_md_iou >= min_checkpoint_score and val_md_iou > best_md_only_iou:
+                best_md_only_iou = val_md_iou
+                best_md_only_epoch = epoch + 1
+                torch.save(model.state_dict(), checkpoint_md_path)
+                print(
+                    f"*** Salvat best-md (IoU={best_md_only_iou:.4f}, ep={epoch + 1}) "
+                    f"-> {checkpoint_md_path} ***"
+                )
+
+        collapse_detected = False
+        if val_result["valid_steps"] == 0 or not model_weights_finite(model):
+            collapse_detected = True
+            print(
+                "[collapse] Validation non-finite or model weights corrupted "
+                f"(val_batches={val_result['valid_steps']}/{val_result['total_steps']})."
+            )
+        elif is_validation_collapsed(val_metrics, best_md_plastic_score=best_val_md_plastic_score):
+            consecutive_collapsed_epochs += 1
+            print(
+                f"[collapse] Zero foreground metrics "
+                f"({consecutive_collapsed_epochs}/{collapse_stop_epochs} consecutive)."
+            )
+            if consecutive_collapsed_epochs >= collapse_stop_epochs:
+                collapse_detected = True
+        else:
+            consecutive_collapsed_epochs = 0
+
+        if max_nonfinite_skips > 0 and paste_stats.get("skipped_batches", 0) >= max_nonfinite_skips:
+            collapse_detected = True
+            print(
+                f"[collapse] Too many non-finite train batches "
+                f"({paste_stats['skipped_batches']} >= {max_nonfinite_skips})."
+            )
+
+        if collapse_detected:
+            if os.path.isfile(checkpoint_path):
+                try:
+                    state = torch.load(checkpoint_path, map_location=device, weights_only=True)
+                except TypeError:
+                    state = torch.load(checkpoint_path, map_location=device)
+                model.load_state_dict(state)
+                print(f"[collapse] Restored best checkpoint from epoch {best_val_md_plastic_epoch}.")
+            print("[collapse] Stopping training to avoid wasting GPU time on dead weights.")
+            break
+
         istoric["train_loss"].append(train_loss)
-        istoric["val_loss"].append(val_loss)
+        istoric["val_loss"].append(
+            val_loss if val_result["valid_steps"] > 0 else float("nan")
+        )
         istoric["val_miou_fg"].append(val_miou_fg)
         istoric["val_fg_binary_iou"].append(val_fg_binary)
         istoric["val_md_iou"].append(val_md_iou)
         istoric["val_binary_debris_iou"].append(val_binary_debris)
         istoric["val_plastic_iou"].append(val_plastic_iou)
         istoric["val_plastic_recall"].append(val_plastic_recall)
+        istoric["val_plastic_precision"].append(val_plastic_precision)
         istoric["val_md_plastic_ckpt_score"].append(val_md_plastic_ckpt)
         istoric["val_checkpoint_score"].append(val_ckpt_score)
         istoric["val_checkpoint_score_ema"].append(val_ckpt_score_ema)
@@ -1114,6 +1513,12 @@ def run_training(
     return {
         "model_key": model_key,
         "checkpoint_path": checkpoint_path,
+        "checkpoint_plastic_path": checkpoint_plastic_path if dual_checkpoints else None,
+        "checkpoint_md_path": checkpoint_md_path if dual_checkpoints else None,
+        "best_plastic_only_iou": best_plastic_only_iou if dual_checkpoints else None,
+        "best_plastic_only_epoch": best_plastic_only_epoch if dual_checkpoints else None,
+        "best_md_only_iou": best_md_only_iou if dual_checkpoints else None,
+        "best_md_only_epoch": best_md_only_epoch if dual_checkpoints else None,
         "history_path": history_path,
         "best_val_miou_fg": best_val_miou,
         "best_val_md_iou": best_val_md_iou,

@@ -287,6 +287,7 @@ def _binary_lovasz_hinge(logits, target_bool):
         logits = logits.squeeze(1)
     if target_bool.ndim == 4:
         target_bool = target_bool.squeeze(1)
+    logits = logits.float().clamp(-12.0, 12.0)
     prob = torch.sigmoid(logits)
     fg = target_bool.float()
     errors = (fg - prob).abs()
@@ -295,7 +296,41 @@ def _binary_lovasz_hinge(logits, target_bool):
     if fg_sorted.sum() == 0:
         return logits.sum() * 0.0
     grad = _lovasz_grad(fg_sorted)
-    return torch.dot(errors_sorted, grad)
+    loss = torch.dot(errors_sorted, grad)
+    if not torch.isfinite(loss):
+        return logits.sum() * 0.0
+    return loss
+
+
+def _binary_focal_bce_with_logits(logits, target, pos_weight, gamma=2.0):
+    target = target.float()
+    bce = F.binary_cross_entropy_with_logits(
+        logits, target, pos_weight=pos_weight, reduction="none",
+    )
+    prob = torch.sigmoid(logits)
+    p_t = prob * target + (1.0 - prob) * (1.0 - target)
+    focal = (1.0 - p_t.clamp(1e-6, 1.0)) ** gamma * bce
+    return focal.mean()
+
+
+def _binary_weighted_bce(logits, target, pos_weight):
+    return F.binary_cross_entropy_with_logits(
+        logits, target.float(), pos_weight=pos_weight,
+    )
+
+
+def _binary_fp_penalty(logits, target, margin=0.35):
+    """Penalize confident debris probability on water pixels (precision)."""
+    logits = logits.float().clamp(-12.0, 12.0)
+    prob = torch.sigmoid(logits).clamp(0.0, 1.0)
+    neg = (target < 0.5).float()
+    if neg.sum() < 1:
+        return logits.sum() * 0.0
+    excess = F.relu(prob - margin) * neg
+    penalty = (excess ** 2).sum() / neg.sum()
+    if not torch.isfinite(penalty):
+        return logits.sum() * 0.0
+    return penalty
 
 
 class MDOutlierLoss(nn.Module):
@@ -310,19 +345,33 @@ class MDOutlierLoss(nn.Module):
         debris_weight=3.0,
         type_weight=0.5,
         seg_weight=0.25,
-        binary_lovasz_weight=0.25,
+        binary_lovasz_weight=0.10,
+        binary_fp_weight=0.75,
+        binary_focal_gamma=2.0,
+        binary_fp_margin=0.35,
+        use_binary_focal=False,
+        fp_penalty_warmup_epochs=8,
+        lovasz_warmup_epochs=3,
         deep_sup_weights=None,
         use_focal=True,
         lovasz_weight=0.10,
-        binary_pos_weight=15.0,
+        binary_pos_weight=10.0,
         focal_gamma=2.0,
         ohem_ratio=0.25,
+        type_class_weights=None,
     ):
         super().__init__()
         self.debris_weight = debris_weight
         self.type_weight = type_weight
         self.seg_weight = seg_weight
         self.binary_lovasz_weight = binary_lovasz_weight
+        self.binary_fp_weight = binary_fp_weight
+        self.binary_focal_gamma = binary_focal_gamma
+        self.binary_fp_margin = binary_fp_margin
+        self.use_binary_focal = use_binary_focal
+        self.fp_penalty_warmup_epochs = fp_penalty_warmup_epochs
+        self.lovasz_warmup_epochs = lovasz_warmup_epochs
+        self.current_epoch = 0
         self.ohem_ratio = ohem_ratio
         self.seg_loss = HybridLoss(
             weight=class_weight,
@@ -332,7 +381,18 @@ class MDOutlierLoss(nn.Module):
         )
         pos_w = torch.tensor([binary_pos_weight], dtype=torch.float32)
         self.register_buffer("_pos_weight", pos_w)
+        if type_class_weights is not None:
+            tw = torch.tensor(type_class_weights, dtype=torch.float32)
+            self.register_buffer("_type_class_weight", tw)
         self.deep_sup_weights = deep_sup_weights or []
+
+    def set_epoch(self, epoch: int) -> None:
+        self.current_epoch = int(epoch)
+
+    def _warmup_scale(self, warmup_epochs: int) -> float:
+        if warmup_epochs <= 0:
+            return 1.0
+        return min(1.0, self.current_epoch / warmup_epochs)
 
     def _md_target(self, target):
         target = _as_long_target(target, 4)
@@ -341,25 +401,55 @@ class MDOutlierLoss(nn.Module):
     def forward(self, outputs, target):
         target = _as_long_target(target, outputs["seg"].shape[1])
         md_target = self._md_target(target)
-        debris_logits = outputs["debris"]
-        bce = F.binary_cross_entropy_with_logits(
-            debris_logits, md_target, pos_weight=self._pos_weight,
+        debris_logits = torch.nan_to_num(
+            outputs["debris"].float(), nan=0.0, posinf=12.0, neginf=-12.0,
         )
-        loss = self.debris_weight * bce
-        if self.binary_lovasz_weight > 0:
-            debris_sq = debris_logits.squeeze(1) if debris_logits.ndim == 4 else debris_logits
-            loss = loss + self.binary_lovasz_weight * _binary_lovasz_hinge(
-                debris_sq, md_target.squeeze(1).bool(),
+        debris_sq = debris_logits.squeeze(1) if debris_logits.ndim == 4 else debris_logits
+        if self.use_binary_focal:
+            bce = _binary_focal_bce_with_logits(
+                debris_logits, md_target, self._pos_weight, gamma=self.binary_focal_gamma,
             )
+        else:
+            bce = _binary_weighted_bce(debris_logits, md_target, self._pos_weight)
+        loss = self.debris_weight * bce
+
+        fp_scale = self._warmup_scale(self.fp_penalty_warmup_epochs)
+        if self.binary_fp_weight > 0 and fp_scale > 0:
+            loss = loss + (self.binary_fp_weight * fp_scale) * _binary_fp_penalty(
+                debris_sq, md_target.squeeze(1), margin=self.binary_fp_margin,
+            )
+
+        lovasz_scale = self._warmup_scale(self.lovasz_warmup_epochs)
+        if self.binary_lovasz_weight > 0 and lovasz_scale > 0:
+            lovasz = _binary_lovasz_hinge(debris_sq, md_target.squeeze(1).bool())
+            if torch.isfinite(lovasz):
+                loss = loss + (self.binary_lovasz_weight * lovasz_scale) * lovasz
+
         if self.seg_weight > 0:
-            loss = loss + self.seg_weight * self.seg_loss(outputs["seg"], target)
+            seg_l = self.seg_loss(outputs["seg"], target)
+            if torch.isfinite(seg_l):
+                loss = loss + self.seg_weight * seg_l
         type_labels = _type_labels_from_target(target, outputs["seg"].shape[1])
         if self.type_weight > 0 and (type_labels != 255).any():
-            loss = loss + self.type_weight * F.cross_entropy(
-                outputs["type"], type_labels, ignore_index=255,
+            type_w = (
+                self._type_class_weight.to(outputs["type"].device)
+                if hasattr(self, "_type_class_weight")
+                else None
             )
+            type_l = F.cross_entropy(
+                outputs["type"], type_labels, weight=type_w, ignore_index=255,
+            )
+            if torch.isfinite(type_l):
+                loss = loss + self.type_weight * type_l
         for w, aux_logits in zip(self.deep_sup_weights, outputs.get("aux", [])):
-            loss = loss + w * self.seg_weight * self.seg_loss(aux_logits, target)
+            aux_l = self.seg_loss(aux_logits, target)
+            if torch.isfinite(aux_l):
+                loss = loss + w * self.seg_weight * aux_l
+
+        if not torch.isfinite(loss):
+            return self.debris_weight * _binary_weighted_bce(
+                debris_logits, md_target, self._pos_weight,
+            )
         return loss
 
 
